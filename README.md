@@ -1,11 +1,18 @@
 # wifiscan
 
-A terminal **WiFi survey & channel planner** for modern macOS, driven straight off
+![platform](https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple)
+![language](https://img.shields.io/badge/Swift-6-orange?logo=swift)
+![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![license](https://img.shields.io/badge/license-MIT-blue)
+
+A terminal **Wi‑Fi survey & channel planner** for modern macOS, driven straight off
 **CoreWLAN**. One scan, one screen: every nearby network with its **name, power,
 SNR, channel, band, width and security** — sortable on any column, with a live
-**channel-congestion map** and a **"cleanest channel" recommendation per band** so
-you can pick the best channel for each of your access points. A single
-self-contained Swift binary, zero third-party dependencies.
+**channel‑congestion map** and a **"cleanest channel" recommendation per band** so
+you can pick the best channel for each of your access points.
+
+A single self‑contained Swift binary. No Homebrew, no Python, no `pip`, no
+third‑party packages.
 
 ```
  wifiscan   iface en0   connected home-router   location authorized
@@ -30,78 +37,165 @@ self-contained Swift binary, zero third-party dependencies.
  [q]uit  [r]escan  [g]raph  [a]uto  [p]ower [s]nr [c]han [n]ame [w]idth s[e]c  [b]and 1/2/6/0  [+/-]interval
 ```
 
+## Contents
+
+- [Features](#features)
+- [Why a custom tool?](#why-a-custom-tool)
+- [Requirements](#requirements)
+- [Install](#install)
+- [First run: grant Location Services](#first-run-grant-location-services)
+- [Usage](#usage)
+- [Reading the table](#reading-the-table)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [The channel map](#the-channel-map)
+- [How recommendations work](#how-recommendations-work)
+- [JSON output](#json-output)
+- [How it reveals SSIDs (the macOS‑26 catch)](#how-it-reveals-ssids-the-macos26-catch)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+- [Known macOS limitations](#known-macos-limitations)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [License](#license)
+
+## Features
+
+- **Full neighbour survey** — SSID, RSSI (dBm), SNR, channel, band (2.4 / 5 / 6 GHz),
+  channel width (20/40/80/160 MHz) and security (Open / WEP / WPA / WPA2 / WPA3 /
+  transition).
+- **Sort by any column** live — power, SNR, channel, name, band, width, security;
+  press a key again to reverse.
+- **Channel‑congestion map** — a power‑weighted occupancy bar per channel, per band,
+  that accounts for channel‑bonding overlap.
+- **"Cleanest channel" recommendations** per band, using energy‑weighted
+  interference scoring (not just AP counts).
+- **Colour‑coded signal** bars and dBm, from bright‑green (excellent) to red (poor).
+- **Live auto‑refresh** with adjustable interval, plus on‑demand rescan.
+- **Band filters** (2.4 / 5 / 6 GHz / all) and scrolling for crowded areas.
+- **Scriptable** — `--once`, `--json` (pipe into `jq`), and `--diag` modes.
+- **Single static binary**, packaged as a signed `.app`; **zero dependencies**.
+
 ## Why a custom tool?
 
-On macOS 14.4+ Apple **removed the `airport` CLI**, and there's no maintained free
+On **macOS 14.4+ Apple removed the `airport` CLI**, and there's no maintained, free
 TUI scanner that returns neighbour RSSI / channel / width. The only API that still
 does is **CoreWLAN** (`CWWiFiClient`), which `wifiscan` drives directly in Swift —
-so it works on the latest macOS with **no Homebrew, no Python, no `pip`**.
+so it works on the latest macOS with nothing to install.
 
-## Build & install
+## Requirements
+
+- **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 12+).
+- **Xcode Command Line Tools** for `swiftc` — `xcode-select --install`.
+- That's it. No Homebrew formulae, no Swift packages.
+
+## Install
 
 ```sh
 make            # build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.bin
 make clean      # remove both
 ```
 
-`make` compiles an optimised, fully-stripped binary (no debug info) into a signed
-`wifiscan.app` bundle and symlinks a `wifiscan` command into `~/.bin`. Make sure
-`~/.bin` is on your `PATH`. You can then run `wifiscan` from any terminal, or
-**double-click `wifiscan.app`** (it reopens itself in Terminal).
+`make` compiles an optimised, fully‑stripped binary (no debug info), embeds an
+`Info.plist`, ad‑hoc code‑signs it inside **`~/Applications/wifiscan.app`**, and
+symlinks a **`wifiscan`** command into **`~/.bin`**.
 
-> Requirements: macOS (built & tested on **26 / Apple Silicon**) and the Xcode
-> Command Line Tools (`xcode-select --install`) for `swiftc`.
+Make sure `~/.bin` is on your `PATH`:
 
-## ⚠️ One-time permission
+```sh
+echo 'export PATH="$HOME/.bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
 
-macOS hides Wi-Fi **SSIDs** unless the scanning app has **Location Services**
-permission. `wifiscan` ships as a signed `.app`, so it appears in that list under
-**its own name**:
+Then run `wifiscan` from any terminal, or **double‑click `wifiscan.app`** — it
+reopens itself inside Terminal and runs the TUI.
+
+## First run: grant Location Services
+
+macOS hides Wi‑Fi **SSIDs** unless the scanning app has **Location Services**
+permission. `wifiscan` ships as a signed `.app`, so it shows up in that list under
+its own name:
 
 1. Run `wifiscan` (or `wifiscan --diag`) once.
 2. **System Settings → Privacy & Security → Location Services** → enable **wifiscan**.
-3. Run `wifiscan` again — `wifiscan --diag` should report **`SSIDs visible: N/N`**.
+3. Run `wifiscan` again. `wifiscan --diag` should report **`SSIDs visible: N/N`**.
 
 Power, channel, band, width and security all work **without** this — only the
 network *names* are gated.
 
-> **Stable permission across rebuilds (optional).** Ad-hoc signing changes the
-> app's identity on every `make`, so macOS forgets the grant. To make it stick,
-> create a self-signed **Code Signing** certificate once (Keychain Access →
-> Certificate Assistant → Create a Certificate, type *Code Signing*) and drop a
-> `Makefile.local` with `SIGN := <cert name>` (git-ignored). Then grant once and
-> every future build keeps it.
+### Keep the grant across rebuilds (optional)
+
+Ad‑hoc signing gives the app a new identity on every `make`, so macOS forgets the
+grant and you'd have to re‑enable it. To make the grant **stick across rebuilds**,
+sign with a stable self‑signed certificate:
+
+1. **Keychain Access → Certificate Assistant → Create a Certificate…**
+   - Name: e.g. `wifiscan-codesign`
+   - Identity Type: **Self Signed Root**
+   - Certificate Type: **Code Signing**
+2. Create a git‑ignored `Makefile.local`:
+   ```make
+   SIGN := wifiscan-codesign
+   ```
+3. `make` now signs with that identity. Grant Location once; every future build
+   keeps it.
+
+(The public repo defaults to ad‑hoc signing, so `make` works for everyone with no
+setup.)
 
 ## Usage
 
 ```sh
-wifiscan                 # interactive TUI (default)
-wifiscan --once          # single scan: table + channel map + recommendations
-wifiscan --json          # single scan as JSON (pipe into jq, etc.)
-wifiscan --diag          # scan + permission diagnostics
-wifiscan --sort snr      # initial sort: power|snr|channel|name|band|width|security
-wifiscan --interval 10   # auto-refresh seconds (default 6)
-wifiscan --no-color      # plain text
-wifiscan --help
+wifiscan                  # interactive TUI (default)
+wifiscan --once           # one scan: table + channel map + recommendations, then exit
+wifiscan --json           # one scan as JSON on stdout (pipe into jq, etc.)
+wifiscan --diag           # scan + permission diagnostics
+wifiscan --help           # usage summary
 ```
 
-## Keys
+| Flag | Description |
+|------|-------------|
+| `--once` | Single scan; print the table, channel map and recommendations, then exit. |
+| `--json` | Single scan; emit a JSON array on stdout. |
+| `--diag` | Print interface, permission status, network/SSID counts and the app bundle path. |
+| `--sort KEY` | Initial sort: `power` \| `snr` \| `channel` \| `name` \| `band` \| `width` \| `security`. |
+| `--interval N` | Auto‑refresh interval in seconds (default `6`, min `2`). |
+| `--no-color` | Disable ANSI colour (useful when piping `--once`). |
+| `--no-relaunch` | Don't reopen in Terminal when launched without a TTY. |
+| `--help`, `-h` | Show usage. |
+
+## Reading the table
+
+| Column | Meaning |
+|--------|---------|
+| **SSID** | Network name. `‹hidden›` = a network not broadcasting its name. |
+| **Chan** | Primary (control) channel number. |
+| **Band** | `2.4`, `5`, or `6` GHz. |
+| **Width** | Channel width in MHz: `20` / `40` / `80` / `160`. |
+| **dBm** | RSSI / signal power. Closer to 0 is stronger (e.g. `-45` ≫ `-85`). |
+| **Signal** | Colour bar of the same value. |
+| **SNR** | Signal‑to‑noise ratio in dB — only shown for the channel your radio is tuned to (see [limitations](#known-macos-limitations)); `—` otherwise. |
+| **Sec** | Security: `Open`, `WEP`, `WPA`, `WPA2`, `WPA3`, or `WPA2/3` (transition). |
+
+**Signal colour key** (by dBm): green `≥ -60` · yellow `-60…-67` · orange
+`-67…-75` · red `< -75`.
+
+## Keyboard shortcuts
 
 | Key | Action | | Key | Action |
 |-----|--------|-|-----|--------|
-| `q` / `Ctrl-C` | quit | | `p` | sort by power |
-| `r` | rescan now | | `s` | sort by SNR |
-| `g` / `Tab` | toggle channel-map view | | `c` | sort by channel |
-| `a` | toggle auto-refresh | | `n` | sort by name |
-| `1` / `2` / `6` | filter to 2.4 / 5 / 6 GHz | | `w` | sort by width |
-| `0` | show all bands | | `e` | sort by security |
-| `b` | cycle band filter | | `j` / `k` | scroll |
-| `+` / `-` | refresh interval | | | press a sort key again to reverse |
+| `q` / `Ctrl‑C` / `Ctrl‑D` | quit | | `p` | sort by **p**ower |
+| `r` | **r**escan now | | `s` | sort by **S**NR |
+| `g` / `Tab` | toggle **g**raph (channel map) | | `c` | sort by **c**hannel |
+| `a` | toggle **a**uto‑refresh | | `n` | sort by **n**ame |
+| `b` | cycle **b**and filter | | `w` | sort by **w**idth |
+| `1` / `2` / `6` | filter to 2.4 / 5 / 6 GHz | | `e` | sort by s**e**curity |
+| `0` | show all bands | | `j` / `k` | scroll down / up |
+| `+` / `-` | refresh interval ± 1s | | | press a sort key again to reverse |
 
-## The channel map (`g`)
+## The channel map
 
-Per band, each occupied channel gets a power-weighted bar — how much signal energy
-actually lands on it — so you can see congestion at a glance:
+Press `g` (or `Tab`) for the congestion view. Per band, each occupied channel gets
+a **power‑weighted bar** — the summed signal energy that lands on it — so crowding
+is obvious at a glance:
 
 ```
  ▎ 2.4 GHz  (12 networks)
@@ -114,35 +208,122 @@ actually lands on it — so you can see congestion at a glance:
    ch 161   3ap  -45dBm  ████████████████████████████████████████  DFS
 ```
 
-## How the recommendation works
+`Nap` is the number of APs overlapping that channel; the dBm is the strongest of
+them; `DFS` marks 5 GHz channels subject to radar detection.
 
-- Each AP is mapped to the **frequency span** it actually occupies, accounting for
-  20 / 40 / 80 / 160 MHz channel bonding (standard 5 GHz bonded groups; the regular
-  6 GHz grid; centre-frequency overlap for 2.4 GHz).
-- For each candidate control channel, `wifiscan` sums the **linear power**
-  (`10^(RSSI/10)`) of every AP whose span overlaps it — so a strong nearby AP counts
-  far more than a weak distant one.
-- The channel with the least overlapping energy wins. **2.4 GHz** only ever
-  recommends **1 / 6 / 11** (the non-overlapping set). **5 GHz** shows the best
-  **non-DFS** channel plus the cleanest **DFS** option (marked `*`; cleaner, but can
-  drop out on radar detection). **6 GHz** uses **PSC** channels.
+## How recommendations work
 
-## How it reveals SSIDs (the macOS-26 catch)
+1. Each AP is mapped to the **frequency span** it actually occupies, accounting for
+   20 / 40 / 80 / 160 MHz channel bonding — standard 5 GHz bonded groups, the
+   regular 6 GHz grid, and centre‑frequency overlap for 2.4 GHz.
+2. For each candidate channel, `wifiscan` sums the **linear power** (`10^(RSSI/10)`)
+   of every AP whose span overlaps it. A strong nearby AP therefore counts far more
+   than a weak distant one — better than naïve "AP count" tools.
+3. The channel with the **least overlapping energy** wins.
 
-This was the hard part. On recent macOS, CoreWLAN redacts SSIDs unless **two**
-conditions hold:
+Per band:
 
-1. The app is **authorized for Location Services** (the one-time grant above), and
-2. The scan runs in a process launched as a real **app session** (via
-   LaunchServices) — *not* a binary spawned directly by a shell. A shell-child
-   process gets masked names even when Location is authorized.
+- **2.4 GHz** → only ever recommends **1 / 6 / 11** (the non‑overlapping set).
+- **5 GHz** → best **non‑DFS** channel (`36/40/44/48/149/153/157/161`), plus the
+  cleanest **DFS** option marked `*` (cleaner, but can momentarily drop on radar
+  detection).
+- **6 GHz** → **PSC** (Preferred Scanning Channels): `5/21/37/…/229`.
 
-So `wifiscan` runs the actual scan in a short-lived **helper instance of itself
-launched via `open`** (`open -n -W -g -j wifiscan.app --args --scan-json …`), which
-counts as an app session and sees real names, then reads the result back as JSON.
-The TUI you interact with is the front-end; each refresh delegates one scan to the
-helper. This needs no Apple Developer account and no special entitlement — just the
-Location grant. (See the commit history for the full investigation.)
+## JSON output
+
+`wifiscan --json` prints a pretty array, sorted by your `--sort` key. `noise` and
+`snr` are present only when macOS actually measured them (otherwise omitted):
+
+```jsonc
+[
+  {
+    "ssid": "home-router",
+    "channel": 6,
+    "band": "2.4 GHz",
+    "widthMHz": 20,
+    "rssi": -34,
+    "security": "WPA2/3",
+    "hidden": false
+  },
+  {
+    "ssid": "home-router-5G",
+    "channel": 161,
+    "band": "5 GHz",
+    "widthMHz": 80,
+    "rssi": -45,
+    "noise": -94,
+    "snr": 49,
+    "security": "WPA2/3",
+    "hidden": false
+  }
+]
+```
+
+Example — busiest 2.4 GHz channels:
+
+```sh
+wifiscan --json | jq -r '.[] | select(.band=="2.4 GHz") | "\(.channel)\t\(.ssid)"' | sort -n
+```
+
+## How it reveals SSIDs (the macOS‑26 catch)
+
+This was the genuinely hard part. On recent macOS, CoreWLAN redacts SSIDs unless
+**two** conditions both hold:
+
+1. The app is **authorized for Location Services** (the one‑time grant above), **and**
+2. The scan runs in a process launched as a real **LaunchServices app session** —
+   *not* a binary spawned directly by a shell. A shell‑child process gets masked
+   names **even when Location is authorized**. (This is why "wrap it in a GUI app"
+   is the usual advice, and why Apple's own tools are unaffected.)
+
+So `wifiscan` runs the actual scan in a short‑lived **helper instance of itself
+launched via `open`**:
+
+```
+open -n -W -g -j wifiscan.app --args --scan-json <tmpfile>
+```
+
+`-n` new instance · `-W` wait · `-g` don't foreground · `-j` launch hidden. The
+helper engages Location, scans (names visible), writes JSON, and exits; the TUI
+reads it back. **No Apple Developer account and no special entitlement are
+required** — only the Location grant. The full investigation is in the commit
+history.
+
+## Architecture
+
+```
+            you ── type `wifiscan` (or double-click the .app)
+             │
+             ▼
+   ┌──────────────────────┐   each refresh   ┌───────────────────────────┐
+   │  TUI front-end        │ ───────────────▶ │  helper: wifiscan          │
+   │  (your terminal)      │   open -n -W …   │  --scan-json  (via open)   │
+   │  render · keys · sort │ ◀─────────────── │  Location + CoreWLAN scan  │
+   └──────────────────────┘   JSON via tmp    └───────────────────────────┘
+                                                          │
+                                                          ▼
+                                              CWWiFiClient.scanForNetworks
+```
+
+- **Front‑end** (`wifiscan` in your terminal): raw‑mode ANSI TUI — rendering, input,
+  sorting, the channel map and recommendations. It does **not** need Location.
+- **Helper** (`wifiscan --scan-json`, reached only via `open`): performs one
+  CoreWLAN scan as a LaunchServices app session so SSIDs are visible, and writes the
+  result as JSON.
+- **Double‑click**: when launched without a TTY (Finder / Spotlight / Dock), the app
+  reopens itself in Terminal so the TUI has somewhere to draw.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---------|-------------|
+| All SSIDs show `‹hidden›` | Location Services not enabled for **wifiscan**. Enable it in System Settings → Privacy & Security → Location Services, then rerun. Check with `wifiscan --diag`. |
+| SSIDs were working, broke after `make` | Ad‑hoc identity changed on rebuild → grant lost. Re‑enable **wifiscan** in Location Services, or use a [stable signing cert](#keep-the-grant-across-rebuilds-optional). |
+| `wifiscan --diag` shows `SSIDs visible: 0/N` | Same as above — permission. The metadata (power/channel) still works. |
+| First scan takes ~3 s | Expected — each scan launches the helper via `open` and lets Location settle. Subsequent refreshes run in the background. |
+| Double‑click prompts "wifiscan wants to control Terminal" | One‑time macOS Automation prompt — click **OK**; it won't ask again. |
+| `Wi‑Fi is powered off` | Turn Wi‑Fi on; the radio must be up to scan. |
+| `command not found: wifiscan` | `~/.bin` isn't on your `PATH` — see [Install](#install). |
 
 ## Known macOS limitations
 
@@ -150,22 +331,38 @@ Location grant. (See the commit history for the full investigation.)
   channel your radio is currently tuned to, so neighbouring APs report noise as 0.
   RSSI + congestion are the reliable planning signals; SNR is meaningful only for
   your connected channel.
-- **No BSSID or country code.** Both are gated behind Apple-*private* entitlements
-  (`com.apple.private.corewifi.bssid` / `.countrycode`) that only `airportd` and
-  Apple's own tools (Wireless Diagnostics, `wdutil`) carry — a third-party binary
+- **No BSSID or country code.** Both are gated behind Apple‑*private* entitlements
+  (`com.apple.private.corewifi.bssid` / `.countrycode`) carried only by `airportd`
+  and Apple's own tools (Wireless Diagnostics, `wdutil`) — a third‑party binary
   always gets `nil`, so `wifiscan` doesn't model them. Not needed for channel
   planning.
 
-## Layout
+## Project layout
 
 ```
 Sources/wifiscan/main.swift   the whole program — scan · channel analysis · TUI
 Info.plist                    app-bundle metadata + Location-Services usage string
 Makefile                      `make` → signed wifiscan.app in ~/Applications + launcher
 Package.swift                 SwiftPM manifest (for editors/tooling; `make` uses swiftc)
+Makefile.local                optional, git-ignored: machine-local SIGN identity
 ```
 
-No third-party dependencies — just the system **CoreWLAN**, **CoreLocation** and
+No third‑party dependencies — just the system **CoreWLAN**, **CoreLocation** and
 **Foundation** frameworks.
 
-Licensed MIT (see `LICENSE`).
+## Development
+
+```sh
+make                       # build + sign + deploy
+swiftc Sources/wifiscan/main.swift -o /tmp/wifiscan \
+    -framework CoreWLAN -framework CoreLocation     # quick type-check / compile
+wifiscan --diag            # verify scanning + permission
+```
+
+The program is a single file. Key pieces: `Scanner` (CoreWLAN wrapper), `ChannelPlan`
+/ `Analysis` (bonding model + congestion scoring), `ScanJSONHelper` / `scanViaHelper`
+(the out‑of‑process scan), and the raw‑mode TUI (`enterRaw`/`draw`/`runInteractive`).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). Copyright © 2026 Lucas Daddiego.
