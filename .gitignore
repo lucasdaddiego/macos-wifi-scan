@@ -6,3 +6,6 @@ _CodeSignature/
 
 # Machine-local Make overrides (e.g. a personal code-signing identity)
 Makefile.local
+
+# Editor / local agent config
+.claude/
