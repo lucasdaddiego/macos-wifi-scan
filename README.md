@@ -69,7 +69,12 @@ third‑party packages.
   that accounts for channel‑bonding overlap.
 - **"Cleanest channel" recommendations** per band, using energy‑weighted
   interference scoring (not just AP counts).
-- **Colour‑coded signal** bars and dBm, from bright‑green (excellent) to red (poor).
+- **Colour‑coded signal** bars and dBm, from bright‑green (excellent) to red (poor) —
+  a smooth **24‑bit gradient** with **sub‑cell (⅛‑block) bars** on truecolor terminals
+  (Ghostty, iTerm, kitty …), gracefully falling back to a 256‑colour palette elsewhere.
+- **Modern‑terminal niceties** — flicker‑free **synchronized** frame updates, **mouse**
+  (wheel‑scroll, click a header to sort) and a live **window/tab title**; all auto‑gated,
+  so dumb terminals and pipes still work.
 - **Live auto‑refresh** with adjustable interval, plus on‑demand rescan.
 - **Band filters** (2.4 / 5 / 6 GHz / all) and scrolling for crowded areas.
 - **Scriptable** — `--once`, `--json` (pipe into `jq`), and `--diag` modes.
@@ -106,8 +111,8 @@ echo 'export PATH="$HOME/.bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
 Then run `wifiscan` from any terminal, or **double‑click `wifiscan.app`** — it
-reopens itself inside your terminal (iTerm if installed, else Terminal) and runs
-the TUI.
+reopens itself inside your terminal (Ghostty, iTerm, then Terminal, whichever is
+installed) and runs the TUI.
 
 ## First run: grant Location Services
 
@@ -162,23 +167,27 @@ wifiscan --help           # usage summary
 That's the whole flag surface — everything else is a **live** TUI control. Sort
 column, band filter and refresh interval are changed with keys while running (see
 [keyboard shortcuts](#keyboard-shortcuts)), and **colour is automatic**: on in a
-terminal, off when piped or redirected. Set `NO_COLOR` to force it off.
+terminal, off when piped or redirected. Set `NO_COLOR` to force it off. **Truecolor**
+is used when the terminal advertises it (`COLORTERM=truecolor`, as Ghostty/iTerm/kitty
+do); otherwise the 256‑colour palette is used.
 
 ## Reading the table
 
 | Column | Meaning |
 |--------|---------|
-| **SSID** | Network name. `‹hidden›` = a network not broadcasting its name. |
+| **SSID** | Network name. `‹hidden›` = a network not broadcasting its name. A `▸` marks the network you're connected to. |
 | **Chan** | Primary (control) channel number. |
-| **Band** | `2.4`, `5`, or `6` GHz. |
+| **Band** | `2.4`, `5`, or `6` GHz — each tinted its own colour (amber / blue / violet) for quick grouping. |
 | **Width** | Channel width in MHz: `20` / `40` / `80` / `160`. |
 | **dBm** | RSSI / signal power. Closer to 0 is stronger (e.g. `-45` ≫ `-85`). |
 | **Signal** | Colour bar of the same value. |
 | **SNR** | Signal‑to‑noise ratio in dB — only shown for the channel your radio is tuned to (see [limitations](#known-macos-limitations)); `—` otherwise. |
 | **Sec** | Security: `Open`, `WEP`, `WPA`, `WPA2`, `WPA3`, or `WPA2/3` (transition). |
+| **Trend** | Sparkline of recent RSSI samples (last ~12 refreshes), so you can see a signal drifting or fluctuating at a glance. Shown on wide terminals only. |
 
 **Signal colour key** (by dBm): bright‑green `≥ -50` · green `-50…-60` · yellow
-`-60…-67` · orange `-67…-75` · red `< -75`.
+`-60…-67` · orange `-67…-75` · red `< -75`. On truecolor terminals this is a smooth
+gradient rather than five steps.
 
 ## Keyboard shortcuts
 
@@ -192,6 +201,16 @@ terminal, off when piped or redirected. Set `NO_COLOR` to force it off.
 | `1` / `2` / `6` | filter to 2.4 / 5 / 6 GHz | | `e` | sort by s**e**curity |
 | `0` | show all bands | | `j` / `k` | scroll down / up |
 | `+` / `-` | refresh interval ± 1s | | | press a sort key again to reverse |
+
+### Mouse
+
+On terminals with mouse reporting (Ghostty, iTerm, kitty, Terminal.app …):
+
+- **Scroll wheel** — scroll the network list / channel map.
+- **Click a column header** — sort by that column (click again to reverse).
+
+Mouse reporting takes over click‑drag, so to **select/copy** text hold **Shift** while
+dragging (the standard terminal bypass).
 
 ## The channel map
 
@@ -320,8 +339,9 @@ is in the commit history.
   file protocol so SSIDs are visible. Subsequent scans skip both the process spawn
   and the Location settle, so refreshes after the first are near‑instant.
 - **Double‑click**: when launched without a TTY (Finder / Spotlight / Dock), the app
-  reopens itself in your terminal (iTerm if installed, else Terminal) so the TUI has
-  somewhere to draw.
+  reopens itself in your terminal so the TUI has somewhere to draw. It picks the first
+  installed of **Ghostty** (via `open … --args -e`), **iTerm**, then **Terminal**
+  (the AppleScript‑driven fallbacks).
 
 ## Troubleshooting
 

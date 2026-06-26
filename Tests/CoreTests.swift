@@ -89,6 +89,40 @@ func mk(_ ssid: String, _ rssi: Int, _ ch: Int, _ band: Band, _ w: Int = 20,
         ok(ChannelPlan.isDFS(52) && ChannelPlan.isDFS(100), "DFS channels")
         ok(!ChannelPlan.isDFS(36) && !ChannelPlan.isDFS(165), "non-DFS channels")
 
+        // truecolor gradients (tuples use built-in `==`, not generic eq)
+        ok(signalRGB(-30).g > signalRGB(-90).g, "strong signal greener than weak")
+        ok(signalRGB(-90) == (220, 60, 55), "weak clamps to red stop")
+        ok(signalRGB(-30) == (60, 220, 95), "strong clamps to bright-green stop")
+        ok(congestionRGB(0) == (70, 200, 90), "quiet → green")
+        ok(congestionRGB(1) == (220, 60, 55), "busiest → red")
+        eq(congestionRGB(2).r, congestionRGB(1).r, "congestion clamps above 1")
+        ok(lerpRGB(0.5, [(0.0, (0, 0, 0)), (1.0, (100, 200, 40))]) == (50, 100, 20), "lerpRGB midpoint")
+
+        // sub-cell bars (⅛-block)
+        eq(subCellBar(0, width: 10), "", "zero fraction → empty")
+        eq(subCellBar(1.0, width: 6), "██████", "full fraction → width full blocks")
+        eq(displayWidth(subCellBar(1.0, width: 6)), 6, "full bar spans exactly width cells")
+        eq(subCellBar(0.5, width: 4), "██", "half of 4 → 2 full blocks")
+        eq(subCellBar(0.01, width: 10), "▏", "tiny positive → 1/8 sliver")
+        eq(subCellBar(0.3125, width: 4), "█▎", "1.25 cells → one full + 2/8 partial")
+        ok(displayWidth(subCellBar(0.77, width: 10)) <= 10, "partial bar never exceeds width")
+
+        // sparklines
+        eq(sparkline([]), "", "empty samples → empty")
+        eq(sparkline([-90]), "▁", "floor sample → lowest glyph")
+        eq(sparkline([-30]), "█", "ceiling sample → highest glyph")
+        eq(displayWidth(sparkline([-40, -55, -70, -85])), 4, "one cell per sample")
+        ok(sparkline([-30]).first! != sparkline([-90]).first!, "strong vs weak differ")
+
+        // band tints distinct per band, with a 256 fallback
+        ok(bandRGB(.ghz24) != bandRGB(.ghz5) && bandRGB(.ghz5) != bandRGB(.ghz6), "band tints distinct")
+        ok(bandColorCode(.ghz24) != bandColorCode(.ghz6), "band 256 fallback distinct")
+
+        // netKey identity
+        eq(netKey(mk("Home", -50, 36, .ghz5)), "Home|36|2", "netKey = ssid|chan|band")
+        ok(netKey(mk("Home", -50, 36, .ghz5)) != netKey(mk("Home", -50, 36, .ghz24)),
+           "same name, different band → different key")
+
         // display width / padding
         eq(displayWidth("abc"), 3, "ascii width")
         eq(displayWidth("你好"), 4, "CJK width = 2 cells each")

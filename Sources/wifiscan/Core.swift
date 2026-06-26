@@ -232,7 +232,8 @@ func widthCodeToMHz(_ raw: Int) -> Int {
     }
 }
 
-/// Signal → 256-colour palette index.
+/// Signal → 256-colour palette index. The fallback for terminals without truecolor
+/// (see signalRGB for the 24-bit gradient used on Ghostty et al.).
 func signalColorCode(_ rssi: Int) -> Int {
     switch rssi {
     case let r where r >= -50: return 46    // bright green
@@ -240,6 +241,111 @@ func signalColorCode(_ rssi: Int) -> Int {
     case let r where r >= -67: return 226   // yellow
     case let r where r >= -75: return 208   // orange
     default: return 196                      // red
+    }
+}
+
+// MARK: - Truecolor gradients (24-bit; used when the terminal advertises COLORTERM)
+
+typealias RGB = (r: Int, g: Int, b: Int)
+
+/// Linear interpolation across an ascending list of (position, colour) stops.
+/// Clamps below the first / above the last stop.
+func lerpRGB(_ x: Double, _ stops: [(at: Double, rgb: RGB)]) -> RGB {
+    guard let first = stops.first else { return (255, 255, 255) }
+    if x <= first.at { return first.rgb }
+    for i in 1..<stops.count {
+        let lo = stops[i - 1], hi = stops[i]
+        if x <= hi.at {
+            let t = hi.at == lo.at ? 0 : (x - lo.at) / (hi.at - lo.at)
+            return (Int((Double(lo.rgb.r) + t * Double(hi.rgb.r - lo.rgb.r)).rounded()),
+                    Int((Double(lo.rgb.g) + t * Double(hi.rgb.g - lo.rgb.g)).rounded()),
+                    Int((Double(lo.rgb.b) + t * Double(hi.rgb.b - lo.rgb.b)).rounded()))
+        }
+    }
+    return stops.last!.rgb
+}
+
+/// Signal → smooth 24-bit colour by dBm: red (weak) → amber → green (strong).
+/// The stop positions mirror signalColorCode's buckets so the two paths agree.
+func signalRGB(_ rssi: Int) -> RGB {
+    lerpRGB(Double(rssi), [
+        (-85, (220,  60,  55)),   // red
+        (-75, (235, 140,  45)),   // orange
+        (-67, (228, 210,  70)),   // yellow
+        (-60, (120, 205,  80)),   // green
+        (-50, ( 60, 220,  95)),   // bright green
+    ])
+}
+
+/// Congestion fraction (0 = quiet → 1 = busiest in band) → green → red, matching
+/// loadColor's buckets.
+func congestionRGB(_ frac: Double) -> RGB {
+    lerpRGB(max(0, min(1, frac)), [
+        (0.00, ( 70, 200,  90)),   // green — quiet
+        (0.45, (228, 210,  70)),   // yellow
+        (0.70, (235, 140,  45)),   // orange
+        (1.00, (220,  60,  55)),   // red — most congested
+    ])
+}
+
+// MARK: - Sub-cell bars (Unicode eighth-blocks)
+
+/// Eighth-block partial cells, index 1…7 = 1/8…7/8 of a cell filled from the left.
+private let eighthBlocks = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+
+/// A horizontal bar with sub-cell precision: the *filled* portion only (no track),
+/// `fraction` of `width` full cells, the final partial cell drawn with an eighth-
+/// block glyph. Any positive fraction shows at least a 1/8 sliver so faint signals
+/// stay visible. Each glyph is one display column wide, so callers can pad/clip by
+/// display width as usual.
+func subCellBar(_ fraction: Double, width: Int) -> String {
+    guard width > 0 else { return "" }
+    let f = max(0.0, min(1.0, fraction))
+    if f <= 0 { return "" }
+    let eighths = max(1, Int((f * Double(width) * 8).rounded()))
+    let full = eighths / 8, rem = eighths % 8
+    return String(repeating: "█", count: full) + eighthBlocks[rem]
+}
+
+/// Vertical-bar sparkline glyphs (▁ lowest … █ highest), one display cell each.
+private let sparkGlyphs = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+/// Render a run of RSSI samples as a sparkline, each value mapped onto the
+/// [lo,hi] dBm scale (the same -90…-30 window the signal bar uses). Empty in →
+/// empty out, so callers can pad/clip by display width.
+func sparkline(_ samples: [Int], lo: Int = -90, hi: Int = -30) -> String {
+    guard !samples.isEmpty, hi > lo else { return "" }
+    let span = Double(hi - lo), top = Double(sparkGlyphs.count - 1)
+    return samples.map { v in
+        let f = max(0.0, min(1.0, (Double(v) - Double(lo)) / span))
+        return sparkGlyphs[Int((f * top).rounded())]
+    }.joined()
+}
+
+/// Stable per-network identity for history tracking. macOS denies third parties the
+/// BSSID, so we key on name+channel+band — good enough except for multiple cloaked
+/// APs sharing a channel (they alias, which is acceptable for a trend sparkline).
+func netKey(_ b: BSS) -> String { "\(b.ssid)|\(b.channel)|\(b.band.rawValue)" }
+
+// MARK: - Per-band accent colours (quick visual grouping of the Band column)
+
+/// 24-bit band tint: 2.4 amber · 5 sky-blue · 6 violet.
+func bandRGB(_ b: Band) -> RGB {
+    switch b {
+    case .ghz24:   return (240, 185,  95)
+    case .ghz5:    return ( 95, 190, 240)
+    case .ghz6:    return (195, 145, 240)
+    case .unknown: return (170, 170, 170)
+    }
+}
+
+/// 256-palette fallback for bandRGB.
+func bandColorCode(_ b: Band) -> Int {
+    switch b {
+    case .ghz24:   return 222   // amber
+    case .ghz5:    return 75    // blue
+    case .ghz6:    return 141   // violet
+    case .unknown: return 245
     }
 }
 

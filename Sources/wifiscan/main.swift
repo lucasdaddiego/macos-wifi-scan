@@ -3,7 +3,7 @@
 // Backend: CoreWLAN (CWWiFiClient) — the only API on modern macOS (airport is
 // gone since 14.4) that returns RSSI / channel / band / width / security for
 // *neighbouring* networks. Requires Location Services permission for the
-// responsible app (Terminal/iTerm) to reveal SSIDs.
+// responsible app (Ghostty/iTerm/Terminal) to reveal SSIDs.
 //
 // What macOS will NOT give a third-party binary (and so we don't model): BSSID
 // and country code are gated behind Apple-private entitlements
@@ -74,6 +74,21 @@ final class Scanner {
     }
 }
 
+// MARK: - Terminal capabilities
+
+/// What the host terminal can do, sniffed once from the environment. Lets the
+/// renderer light up modern features on Ghostty/iTerm/kitty while degrading to the
+/// portable path on Terminal.app or when piped.
+enum Term {
+    /// 24-bit colour. Ghostty (and iTerm, kitty, modern xterm) export
+    /// COLORTERM=truecolor for child processes; we inherit it whether wifiscan is
+    /// typed at a shell or run directly via `ghostty -e`.
+    static let truecolor: Bool = {
+        let ct = ProcessInfo.processInfo.environment["COLORTERM"]
+        return ct == "truecolor" || ct == "24bit"
+    }()
+}
+
 // MARK: - ANSI
 
 enum Ansi {
@@ -85,17 +100,33 @@ enum Ansi {
     static func dim(_ s: String) -> String { wrap(s, "2") }
     static func fg256(_ s: String, _ c: Int) -> String { wrap(s, "38;5;\(c)") }
     static func bg256(_ s: String, _ c: Int) -> String { wrap(s, "48;5;\(c)") }
+    static func fgRGB(_ s: String, _ c: RGB) -> String { wrap(s, "38;2;\(c.r);\(c.g);\(c.b)") }
 
     // Signal → colour (256-palette). Logic lives in Core (signalColorCode) so it
     // is unit-testable without this enum.
     static func signalColor(_ rssi: Int) -> Int { signalColorCode(rssi) }
 
+    /// Colour a string by signal strength — a smooth 24-bit gradient on truecolor
+    /// terminals, the 256-palette bucket otherwise.
+    static func signalColored(_ s: String, _ rssi: Int) -> String {
+        Term.truecolor ? fgRGB(s, signalRGB(rssi)) : fg256(s, signalColorCode(rssi))
+    }
+    /// Colour a string by congestion fraction (0 quiet → 1 busiest), truecolor or 256.
+    static func congestionColored(_ s: String, _ frac: Double) -> String {
+        Term.truecolor ? fgRGB(s, congestionRGB(frac)) : fg256(s, loadColor(frac))
+    }
+    /// Tint a string with the band's accent colour, truecolor or 256.
+    static func bandColored(_ s: String, _ b: Band) -> String {
+        Term.truecolor ? fgRGB(s, bandRGB(b)) : fg256(s, bandColorCode(b))
+    }
+
     static func signalBar(_ rssi: Int, width: Int = 10) -> String {
-        // Map -90..-30 dBm → 0..width blocks.
+        // Map -90..-30 dBm → 0..width cells, with sub-cell (⅛-block) precision and a
+        // dotted track for the remainder.
         let frac = max(0.0, min(1.0, Double(rssi + 90) / 60.0))
-        let filled = Int((frac * Double(width)).rounded())
-        let bar = String(repeating: "█", count: filled) + String(repeating: "·", count: width - filled)
-        return fg256(bar, signalColor(rssi))
+        let fill = subCellBar(frac, width: width)
+        let track = String(repeating: "·", count: max(0, width - displayWidth(fill)))
+        return signalColored(fill + track, rssi)
     }
 }
 
@@ -113,6 +144,9 @@ private enum Pal {
     static let error = 196                   // scan errors
     static let scanning = 226                // scanning spinner
 }
+
+/// Braille spinner frames for the in-flight scan indicator.
+private let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 /// Channel-map bar colour by congestion fraction (0 = quiet → 1 = busiest channel
 /// in the band), so the bar's colour and length tell the same story.
@@ -175,36 +209,81 @@ func termSize() -> Layout {
 
 func bandFilterLabel(_ b: Band?) -> String { b?.longLabel ?? "All bands" }
 
-private func renderTable(_ nets: [BSS], cols: Int) -> [String] {
-    // Column widths (responsive-ish; SSID flexes).
-    let wChan = 7, wBand = 5, wWidth = 6, wSig = 6, wBar = 11, wSnr = 5, wSec = 7
-    let fixed = wChan + wBand + wWidth + wSig + wBar + wSnr + wSec + 7 // gaps
-    let wSSID = max(14, min(32, cols - fixed))
+/// Table column widths (responsive-ish; SSID flexes to fill). Shared by renderTable
+/// and tableSortRegions so the on-screen layout and the mouse hit-test can't drift.
+/// The Trend (sparkline) column only appears once the window is wide enough to spare
+/// the room, so narrow terminals lose nothing.
+private func tableColWidths(_ cols: Int) -> (ssid: Int, chan: Int, band: Int, width: Int, sig: Int, bar: Int, snr: Int, sec: Int, trend: Int) {
+    let chan = 7, band = 5, width = 6, sig = 6, bar = 11, snr = 5, sec = 7
+    let trend = cols >= 96 ? App.historyLen : 0          // sparkline column, wide screens only
+    let nCols = trend > 0 ? 9 : 8
+    let fixed = chan + band + width + sig + bar + snr + sec + trend + (nCols - 1) // gaps
+    let ssid = max(14, min(32, cols - fixed))
+    return (ssid, chan, band, width, sig, bar, snr, sec, trend)
+}
+
+/// x-ranges (1-based screen columns) of each header cell paired with the sort key a
+/// click on it selects. Order mirrors renderTable's columns; "dBm", "Signal" and
+/// "Trend" all sort by power. Used by mouse click-to-sort.
+func tableSortRegions(_ cols: Int) -> [(range: ClosedRange<Int>, key: SortKey)] {
+    let w = tableColWidths(cols)
+    var order: [(Int, SortKey)] = [
+        (w.ssid, .name), (w.chan, .channel), (w.band, .band), (w.width, .width),
+        (w.sig, .power), (w.bar, .power), (w.snr, .snr), (w.sec, .security),
+    ]
+    if w.trend > 0 { order.append((w.trend, .power)) }
+    var regions: [(range: ClosedRange<Int>, key: SortKey)] = []
+    var x = 1
+    for (width, key) in order {
+        regions.append((x...(x + width - 1), key))
+        x += width + 1   // +1 for the " " separator between columns
+    }
+    return regions
+}
+
+private func renderTable(_ nets: [BSS], cols: Int, connSSID: String?, history: [String: [Int]]) -> [String] {
+    let w = tableColWidths(cols)
+    let (wSSID, wChan, wBand, wWidth, wSig, wBar, wSnr, wSec, wTrend) = (w.ssid, w.chan, w.band, w.width, w.sig, w.bar, w.snr, w.sec, w.trend)
     var out: [String] = []
 
-    let header = [
+    var headerCells = [
         padTo("SSID", wSSID), padLeft("Chan", wChan), padTo("Band", wBand),
         padLeft("Width", wWidth), padLeft("dBm", wSig), padTo("Signal", wBar),
         padLeft("SNR", wSnr), padTo("Sec", wSec),
-    ].joined(separator: " ")
-    out.append(Ansi.bold(Ansi.fg256(header, Pal.text)))
+    ]
+    if wTrend > 0 { headerCells.append(padTo("Trend", wTrend)) }
+    out.append(Ansi.bold(Ansi.fg256(headerCells.joined(separator: " "), Pal.text)))
 
     for n in nets {
         let snrStr = n.snr.map { "\($0)" } ?? "—"
         let widthStr = n.widthMHz > 0 ? "\(n.widthMHz)" : "—"
-        let ssid = Ansi.fg256(padTo(n.ssid, wSSID), n.hidden ? Pal.label : Pal.value)
+        let connected = connSSID != nil && !n.hidden && n.ssid == connSSID
+        // The connected network glows in the accent colour; others use the usual
+        // value/dim tints. A leading "▸" marks it without disturbing column widths
+        // (it replaces the first cell of the SSID field, which padTo reserves).
+        let ssidText = connected ? "▸ " + n.ssid : n.ssid
+        let ssid = connected
+            ? Ansi.bold(Ansi.fg256(padTo(ssidText, wSSID), Pal.accent))
+            : Ansi.fg256(padTo(ssidText, wSSID), n.hidden ? Pal.label : Pal.value)
         let chan = padLeft("\(n.channel)", wChan)
-        let band = padTo(n.band.label, wBand)
-        let dbm = Ansi.fg256(padLeft("\(n.rssi)", wSig), Ansi.signalColor(n.rssi))
+        let band = Ansi.bandColored(padTo(n.band.label, wBand), n.band)
+        let dbm = Ansi.signalColored(padLeft("\(n.rssi)", wSig), n.rssi)
         // signalBar already emits exactly (wBar-1) blocks + 1 space = wBar visible
         // cells, so it is dropped into the row directly — never padded. (padTo on an
         // ANSI string counts escape bytes and would truncate mid-escape.)
         let bar = Ansi.signalBar(n.rssi, width: wBar - 1) + " "
         let snr = padLeft(snrStr, wSnr)
         let sec = padTo(n.security, wSec)
-        let line = [ssid, chan, band, padLeft(widthStr, wWidth), dbm, bar, snr, sec]
-            .joined(separator: " ")
-        out.append(line)
+        var cells = [ssid, chan, band, padLeft(widthStr, wWidth), dbm, bar, snr, sec]
+        if wTrend > 0 {
+            // Right-align the sparkline so the latest sample sits at the column edge;
+            // colour it by the current signal so trend and strength read together.
+            let samples = history[netKey(n)] ?? [n.rssi]
+            let spark = sparkline(samples)
+            let padded = String(repeating: " ", count: max(0, wTrend - displayWidth(spark))) + spark
+            cells.append(Ansi.signalColored(padded, n.rssi))
+        }
+        out.append(cells.joined(separator: " "))
     }
     return out
 }
@@ -226,15 +305,15 @@ private func renderGraph(_ nets: [BSS], cols: Int) -> [String] {
         let maxW = max(loads.map { $0.weighted }.max() ?? 1, 1e-9)
         for load in loads.sorted(by: { $0.channel < $1.channel }) {
             let frac = load.weighted / maxW
-            let barLen = Int(frac * Double(max(0, min(cols - 28, 40))))
-            let bar = String(repeating: "█", count: max(load.weighted > 0 ? 1 : 0, barLen))
+            let barMax = max(0, min(cols - 28, 40))
+            let bar = subCellBar(frac, width: barMax)   // ⅛-block sub-cell precision
             let dfs = (band == .ghz5 && ChannelPlan.isDFS(load.channel)) ? Ansi.fg256(" DFS", Pal.label) : ""
             let label = padLeft("ch \(load.channel)", 7)
             let cnt = padLeft("\(load.apCount)ap", 5)
             let strongest = padLeft(load.apCount > 0 ? "\(load.strongest)dBm" : "—", 8)
             // Colour by congestion (same metric as the bar's length), so a long red
             // bar reliably means "most congested" rather than "has one loud AP".
-            let colored = Ansi.fg256(bar, loadColor(frac))
+            let colored = Ansi.congestionColored(bar, frac)
             out.append("  \(label) \(cnt) \(strongest)  \(colored)\(dfs)")
         }
     }
@@ -307,6 +386,23 @@ final class App {
     var lastFrame = ""
     var lastCols = 0
     var lastRows = 0
+    var lastTitle = ""             // last OSC-2 window title emitted (de-dupe)
+
+    // --- mouse hit-test state, refreshed each draw (main-thread-confined) ---
+    var headerScreenRow = -1                                  // 1-based row of the table header (-1 = none/graph)
+    var sortRegions: [(range: ClosedRange<Int>, key: SortKey)] = []
+    /// Sort key whose header cell covers 1-based screen column `col`, if any.
+    func sortColumnAt(_ col: Int) -> SortKey? { sortRegions.first { $0.range.contains(col) }?.key }
+
+    // --- per-network RSSI history for sparklines (guard with `lock`) ---
+    static let historyLen = 12
+    var history: [String: [Int]] = [:]
+    /// Copy the history under the lock for use on the main (render) thread.
+    func historyCopy() -> [String: [Int]] { lock.lock(); defer { lock.unlock() }; return history }
+    /// Lightweight locked read of the scanning latch (for the spinner animation).
+    func isScanning() -> Bool { lock.lock(); defer { lock.unlock() }; return scanning }
+
+    var spinnerTick = 0            // advances each idle loop while scanning (main-thread-confined)
 
     init() {
         ifaceName = scanner.interfaceName
@@ -331,7 +427,20 @@ final class App {
             let iface = self.scanner.interfaceName
             let conn = self.scanner.currentSSID
             self.lock.lock()
-            if result.error == nil { self.nets = result.nets }
+            if result.error == nil {
+                self.nets = result.nets
+                // Append this scan's RSSI to each network's ring buffer, then drop
+                // histories for networks that vanished — keeps the map bounded and the
+                // sparklines aligned to what's currently on screen.
+                let live = Set(result.nets.map { netKey($0) })
+                self.history = self.history.filter { live.contains($0.key) }
+                for n in result.nets {
+                    var h = self.history[netKey(n), default: []]
+                    h.append(n.rssi)
+                    if h.count > App.historyLen { h.removeFirst(h.count - App.historyLen) }
+                    self.history[netKey(n)] = h
+                }
+            }
             self.scanError = result.error
             if let s = result.status { self.locationStatus = s }
             self.ifaceName = iface
@@ -386,7 +495,10 @@ private func enterRaw() {
         }
     }
     tcsetattr(STDIN_FILENO, TCSANOW, &raw)
-    writeRaw("\u{1B}[?1049h\u{1B}[?25l")   // alt screen + hide cursor
+    // alt screen + hide cursor · save the window title so we can restore it on exit
+    // · enable SGR mouse reporting (button presses + wheel). Terminals that don't
+    // support a given mode silently ignore it.
+    writeRaw("\u{1B}[?1049h\u{1B}[?25l\u{1B}[22;2t\u{1B}[?1000h\u{1B}[?1006h")
 }
 
 /// Async-signal-safe: uses only write() and tcsetattr() (both on the POSIX
@@ -395,24 +507,52 @@ private func enterRaw() {
 private func leaveRaw() {
     guard rawActive != 0 else { return }
     rawActive = 0
-    writeRaw("\u{1B}[?25h\u{1B}[?1049l")   // show cursor + main screen
+    // Mirror enterRaw in reverse: disable mouse · show cursor + main screen · restore
+    // the saved window title. All async-signal-safe (write only).
+    writeRaw("\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l\u{1B}[23;2t")
     tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
 }
 
-private func readKey() -> Character? {
-    var buf = [UInt8](repeating: 0, count: 1)
-    let n = read(STDIN_FILENO, &buf, 1)
-    guard n == 1 else { return nil }
-    let b = buf[0]
-    // Drain (and ignore) ANSI escape sequences (arrow keys etc.) so their trailing
-    // bytes aren't mistaken for single-key commands.
-    if b == 0x1B {
-        var skip = [UInt8](repeating: 0, count: 8)
-        _ = read(STDIN_FILENO, &skip, 8)   // VMIN=0/VTIME=1 → returns promptly
-        return nil
+/// A decoded mouse report (SGR 1006). `col`/`row` are 1-based screen cells.
+struct MouseEvent { let button: Int; let col: Int; let row: Int; let press: Bool }
+
+/// One unit of input: a single-key command, a mouse report, or nothing this tick.
+enum Input { case key(Character), mouse(MouseEvent), none }
+
+private func readByte() -> UInt8? {
+    var b: UInt8 = 0
+    return read(STDIN_FILENO, &b, 1) == 1 ? b : nil
+}
+
+private func readInput() -> Input {
+    guard let b = readByte() else { return .none }
+    if b != 0x1B {
+        // ASCII only — TUI commands are all single-byte; ignore multibyte UTF-8.
+        return b < 0x80 ? .key(Character(UnicodeScalar(b))) : .none
     }
-    // ASCII only — TUI commands are all single-byte; ignore multibyte UTF-8.
-    return b < 0x80 ? Character(UnicodeScalar(b)) : nil
+    // ESC: a lone Esc, an arrow/function key, or an SGR mouse report. Only CSI ("ESC [")
+    // carries mouse; anything else we drain and ignore.
+    guard let b1 = readByte() else { return .none }     // lone Esc
+    guard b1 == 0x5B /* [ */ else { _ = readByte(); return .none }  // e.g. SS3 (ESC O …)
+    // Drain the CSI body up to its final byte (0x40–0x7E). Draining the WHOLE sequence
+    // — not a fixed byte count — is what keeps a mouse report's digits from leaking out
+    // as stray single-key commands. 32 bytes is well above any real sequence.
+    var body = [UInt8]()
+    for _ in 0..<32 {
+        guard let c = readByte() else { break }
+        body.append(c)
+        if (0x40...0x7E).contains(c) { break }
+    }
+    // SGR mouse: "ESC [ < b ; x ; y" then 'M' (press) or 'm' (release).
+    if let first = body.first, first == 0x3C /* < */,
+       let final = body.last, final == 0x4D /* M */ || final == 0x6D /* m */ {
+        let nums = String(decoding: body.dropFirst().dropLast(), as: UTF8.self)
+            .split(separator: ";").compactMap { Int($0) }
+        if nums.count == 3 {
+            return .mouse(MouseEvent(button: nums[0], col: nums[1], row: nums[2], press: final == 0x4D))
+        }
+    }
+    return .none
 }
 
 // MARK: - Interactive loop
@@ -450,14 +590,21 @@ func runInteractive(app: App) {
             if app.triggerScan() { lastAuto = Date() }
         }
         // Redraw only when something actually changed — input, scan state, or a
-        // resize. Otherwise the loop just idles in readKey() at ~0% CPU.
+        // resize. Otherwise the loop just idles in readKey() at ~0% CPU. While a scan
+        // is in flight we also tick the spinner so it animates (~10 fps via VTIME).
         let sz = termSize()
         let gen = app.readGeneration()
-        if gen != lastGen || sz.cols != lastCols || sz.rows != lastRows {
+        let scanning = app.isScanning()
+        if scanning { app.spinnerTick &+= 1 }
+        if gen != lastGen || sz.cols != lastCols || sz.rows != lastRows || scanning {
             draw(app)
             lastGen = gen; lastCols = sz.cols; lastRows = sz.rows
         }
-        if let k = readKey() { handleKey(k, app: app) }
+        switch readInput() {
+        case .key(let k):   handleKey(k, app: app)
+        case .mouse(let m): handleMouse(m, app: app)
+        case .none:         break
+        }
     }
     leaveRaw()
     HelperClient.shared.shutdown()
@@ -489,6 +636,24 @@ func handleKey(_ k: Character, app: App) {
     app.markDirty()   // any key may have changed view state → redraw next loop
 }
 
+func handleMouse(_ m: MouseEvent, app: App) {
+    // Wheel reports as buttons 64 (up) / 65 (down), regardless of press/release.
+    if m.button & 64 != 0 {
+        if m.button & 1 == 0 { app.scroll = max(0, app.scroll - 3) }   // wheel up
+        else { app.scroll += 3 }                                       // wheel down (draw clamps)
+        app.markDirty()
+        return
+    }
+    // Left-button press on the table header → sort by the clicked column. Bit 5 (32)
+    // marks motion/drag; the low two bits select the button (0 = left).
+    let leftPress = m.press && m.button & 0b11 == 0 && m.button & 32 == 0
+    guard leftPress, !app.graphMode, m.row == app.headerScreenRow else { return }
+    if let key = app.sortColumnAt(m.col) {
+        setSort(app, key)
+        app.markDirty()
+    }
+}
+
 func setSort(_ app: App, _ key: SortKey) {
     if app.sortKey == key { app.ascending.toggle() } else { app.sortKey = key; app.ascending = false }
     app.scroll = 0
@@ -509,10 +674,21 @@ func draw(_ app: App) {
     let snap = app.snapshot()
     let visible = app.visibleNets(snap.nets)
 
+    // Live window/tab title (OSC 2), emitted only when it changes. Shown by Ghostty
+    // et al.; restored to the saved title on exit (see leaveRaw).
+    if Ansi.enabled {
+        let title = "wifiscan — \(snap.nets.count) networks · \(snap.iface)"
+        if title != app.lastTitle {
+            app.lastTitle = title
+            print("\u{1B}]2;\(title)\u{07}", terminator: "")
+        }
+    }
+
     var lines: [String] = []
 
-    // Header
-    let scanningTag = snap.scanning ? Ansi.fg256(" ⟳ scanning…", Pal.scanning) : ""
+    // Header — an animated braille spinner while a scan is in flight.
+    let spinner = spinnerFrames[app.spinnerTick % spinnerFrames.count]
+    let scanningTag = snap.scanning ? Ansi.fg256(" \(spinner) scanning…", Pal.scanning) : ""
     let lastStr = snap.last.map { timeFormatter.string(from: $0) } ?? "—"
     let head1 = Ansi.bg256(Ansi.bold(Ansi.fg256("  wifiscan  ", Pal.badgeFg)), Pal.badgeBg)
         + " " + Ansi.fg256("iface ", Pal.label) + Ansi.fg256(snap.iface, Pal.value)
@@ -553,7 +729,7 @@ func draw(_ app: App) {
     if app.graphMode {
         body = renderGraph(visible, cols: layout.cols)
     } else {
-        body = renderTable(visible, cols: layout.cols)
+        body = renderTable(visible, cols: layout.cols, connSSID: snap.conn, history: app.historyCopy())
     }
     // Scroll handling (keep header row when scrolling table).
     let headerRow = (!app.graphMode && !body.isEmpty) ? body.removeFirst() : nil
@@ -561,6 +737,16 @@ func draw(_ app: App) {
     if app.scroll > maxScroll { app.scroll = maxScroll }
     var bodyView = Array(body.dropFirst(app.scroll).prefix(bodyBudget - (headerRow != nil ? 1 : 0)))
     if let h = headerRow { bodyView.insert(h, at: 0) }
+
+    // Record where the table header lands (1-based screen row) and the clickable
+    // column regions, so a mouse click can map to a sort column. bodyView[0] is the
+    // header, so it renders at the next screen row after the chrome already in `lines`.
+    if headerRow != nil {
+        app.headerScreenRow = lines.count + 1
+        app.sortRegions = tableSortRegions(layout.cols)
+    } else {
+        app.headerScreenRow = -1
+    }
 
     lines.append(contentsOf: bodyView)
     // Pad the body region so the bottom chrome sits flush at the bottom. `used` must
@@ -573,7 +759,7 @@ func draw(_ app: App) {
     }
     lines.append(Ansi.dim(String(repeating: "─", count: min(layout.cols, 120))))
     lines.append(contentsOf: recLines)
-    lines.append(contentsOf: footer)
+    lines.append(contentsOf: footer.map { clipAnsi($0, layout.cols) })   // never wrap the layout
 
     // Paint. Clear each line to EOL rather than wiping the whole screen every frame
     // (that caused continuous flicker), and skip the write entirely when the frame
@@ -588,12 +774,14 @@ func draw(_ app: App) {
     app.lastFrame = screen
     app.lastCols = layout.cols
     app.lastRows = layout.rows
-    print(screen, terminator: "")
+    // Synchronized output (DEC 2026): the terminal buffers the whole frame and swaps
+    // it in one shot, so a refresh never tears. Ignored by terminals that lack it.
+    print("\u{1B}[?2026h" + screen + "\u{1B}[?2026l", terminator: "")
     fflush(stdout)
 }
 
 func footerLines() -> [String] {
-    let keys = "[q]uit  [r]escan  [g]raph  [a]uto  [p]ower [s]nr [c]han [n]ame [w]idth s[e]c  [b]and 1/2/6/0  [j/k]scroll  [+/-]interval"
+    let keys = "[q]uit  [r]escan  [g]raph  [a]uto  [p]ower [s]nr [c]han [n]ame [w]idth s[e]c  [b]and 1/2/6/0  [j/k]scroll  [+/-]interval  ·  mouse: wheel scrolls, click a header to sort"
     return [Ansi.dim(keys)]
 }
 
@@ -647,7 +835,8 @@ func runOnce(app: App, json: Bool) {
         print(Ansi.fg256("⚠ SSIDs hidden — enable 'wifiscan' in System Settings → Privacy & Security → Location Services.", Pal.warn))
     }
     print("")
-    for line in renderTable(nets, cols: termSize().cols) { print(line) }
+    // One-shot: no cross-scan history, so each sparkline shows its single sample.
+    for line in renderTable(nets, cols: termSize().cols, connSSID: app.scanner.currentSSID, history: [:]) { print(line) }
     print("")
     for line in renderGraph(nets, cols: termSize().cols) { print(line) }
     print("")
@@ -901,13 +1090,43 @@ private func sweepStaleTempFiles() {
 
 // MARK: - Relaunch in Terminal (for Finder/Spotlight/Dock launches)
 
-/// Open the user's terminal and exec this binary there, so a double-click "opens
-/// the app". `exec` replaces the shell with wifiscan, so quitting the TUI closes the
-/// window. The in-bundle binary keeps the app's code identity, so Location works.
-/// Prefers iTerm if it's installed (a strong signal it's the user's terminal),
-/// otherwise Terminal.app.
+/// Open the user's terminal and run this binary there, so a double-click "opens
+/// the app". Quitting the TUI closes the window. The in-bundle binary keeps the
+/// app's code identity, so Location works.
+///
+/// Preference order, each gated on being installed (a deliberate third-party
+/// terminal is a strong signal it's the user's): Ghostty → iTerm → Terminal.app
+/// (always present, so the final fallback).
 private func relaunchInTerminal() {
     let exe = Bundle.main.executablePath ?? CommandLine.arguments.first ?? "wifiscan"
+    if launchInGhostty(exe: exe) { return }
+    relaunchViaAppleScript(exe: exe)
+}
+
+/// Ghostty has no AppleScript dictionary, so it's driven the way `ghostty --help`
+/// documents: `open -na Ghostty.app --args -e <command>`. With `-e`, Ghostty runs
+/// the binary directly as the surface's process and auto-closes (and quits the
+/// new instance) when it exits — the same "quit the TUI, window goes away" feel as
+/// the `exec`-into-a-shell path below, with no shell wrapper needed. Returns true
+/// only if a Ghostty window was actually launched.
+private func launchInGhostty(exe: String) -> Bool {
+    let home = NSHomeDirectory()
+    let installed = ["/Applications/Ghostty.app", "\(home)/Applications/Ghostty.app"]
+        .contains { FileManager.default.fileExists(atPath: $0) }
+    guard installed else { return false }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    // `exe` is one argv element, so spaces in the path survive untouched.
+    p.arguments = ["-na", "Ghostty.app", "--args", "-e", exe]
+    do { try p.run() } catch { return false }
+    p.waitUntilExit()                 // waits for `open`, which returns once Ghostty launches
+    return p.terminationStatus == 0
+}
+
+/// AppleScript-driven fallback for iTerm / Terminal.app, which both expose a
+/// scripting dictionary. `exec` replaces the spawned shell with wifiscan, so
+/// quitting the TUI closes the window.
+private func relaunchViaAppleScript(exe: String) {
     let shellSafe = exe.replacingOccurrences(of: "'", with: "'\\''")   // shell single-quote escape
     let shellCmd = "clear; exec '\(shellSafe)'"
     // The command is interpolated into a double-quoted AppleScript string literal,
