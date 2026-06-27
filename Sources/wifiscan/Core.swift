@@ -34,14 +34,13 @@ struct BSS {
             let fc = Band.centerFreq(.ghz24, channel)
             return (fc - Double(w) / 2.0, fc + Double(w) / 2.0)
         case .ghz5, .ghz6, .unknown:
-            let chans = ChannelPlan.coveredChannels(band: band, control: channel, widthMHz: w)
-            guard let first = chans.first, let last = chans.last else {
-                let fc = Band.centerFreq(band, channel)
-                return (fc - Double(w) / 2.0, fc + Double(w) / 2.0)
-            }
-            let lo = Band.centerFreq(band, first) - 10.0
-            let hi = Band.centerFreq(band, last) + 10.0
-            return (lo, hi)
+            // coveredChannels always yields at least the control channel, so fold the
+            // covered 20 MHz slots into the frequency span they occupy; ±10 MHz widens
+            // each edge slot to its full 20 MHz. (min/max, not first/last, so the result
+            // is independent of the table's channel ordering.)
+            let freqs = ChannelPlan.coveredChannels(band: band, control: channel, widthMHz: w)
+                .map { Band.centerFreq(band, $0) }
+            return (freqs.min()! - 10.0, freqs.max()! + 10.0)
         }
     }
 }
@@ -125,8 +124,7 @@ enum ChannelPlan {
             // sits off the (ch-1)/4 grid, so never bond it.
             guard control >= 1, control != 2 else { return [control] }
             let slot = (control - 1) / 4          // 0-based 20 MHz slot
-            let groupSize = widthMHz / 20          // # of 20 MHz slots bonded
-            guard groupSize > 0 else { return [control] }
+            let groupSize = widthMHz / 20          // # of 20 MHz slots bonded (≥1: widthMHz > 20 above)
             let start = (slot / groupSize) * groupSize
             return (0..<groupSize).map { 1 + (start + $0) * 4 }
         case .ghz24:
@@ -176,14 +174,18 @@ enum Analysis {
         }
     }
 
+    /// Order two channel loads cleanest-first: least overlapping energy, then fewest
+    /// APs, then lowest channel (a deterministic tie-break). Extracted from `recommend`
+    /// so the ordering policy is unit-testable on its own.
+    static func cleaner(_ a: ChannelLoad, _ b: ChannelLoad) -> Bool {
+        if a.weighted != b.weighted { return a.weighted < b.weighted }
+        if a.apCount != b.apCount { return a.apCount < b.apCount }
+        return a.channel < b.channel
+    }
+
     /// Cleanest candidates first (least overlapping energy, then fewest APs).
     static func recommend(_ nets: [BSS], band: Band, candidates: [Int]) -> [ChannelLoad] {
-        loads(nets, band: band, candidates: candidates)
-            .sorted { a, b in
-                if a.weighted != b.weighted { return a.weighted < b.weighted }
-                if a.apCount != b.apCount { return a.apCount < b.apCount }
-                return a.channel < b.channel        // stable, deterministic tie-break
-            }
+        loads(nets, band: band, candidates: candidates).sorted(by: cleaner)
     }
 }
 
@@ -204,18 +206,25 @@ enum SortKey {
     }
 }
 
-func sortNets(_ nets: [BSS], by key: SortKey, ascending: Bool) -> [BSS] {
-    let sorted = nets.sorted { a, b in
-        switch key {
-        case .power:    return a.rssi != b.rssi ? a.rssi > b.rssi : a.ssid < b.ssid
-        case .snr:      return (a.snr ?? -999) != (b.snr ?? -999) ? (a.snr ?? -999) > (b.snr ?? -999) : a.rssi > b.rssi
-        case .channel:  return a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi
-        case .name:     return a.ssid.lowercased() != b.ssid.lowercased() ? a.ssid.lowercased() < b.ssid.lowercased() : a.rssi > b.rssi
-        case .band:     return a.band.rawValue != b.band.rawValue ? a.band.rawValue < b.band.rawValue : a.rssi > b.rssi
-        case .width:    return a.widthMHz != b.widthMHz ? a.widthMHz > b.widthMHz : a.rssi > b.rssi
-        case .security: return a.security != b.security ? a.security < b.security : a.rssi > b.rssi
-        }
+/// Strict ordering of two networks for `key`'s default (descending-ish) direction;
+/// every key falls back to RSSI (or, for power, SSID) so the order is total and
+/// stable. Extracted from `sortNets` so each branch — including the SNR nil-coalescing
+/// paths, which a single `sorted` pass can't drive deterministically — is unit-testable.
+/// Unmeasured SNR sorts below any measured value via the -999 sentinel.
+func netBefore(_ a: BSS, _ b: BSS, by key: SortKey) -> Bool {
+    switch key {
+    case .power:    return a.rssi != b.rssi ? a.rssi > b.rssi : a.ssid < b.ssid
+    case .snr:      return (a.snr ?? -999) != (b.snr ?? -999) ? (a.snr ?? -999) > (b.snr ?? -999) : a.rssi > b.rssi
+    case .channel:  return a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi
+    case .name:     return a.ssid.lowercased() != b.ssid.lowercased() ? a.ssid.lowercased() < b.ssid.lowercased() : a.rssi > b.rssi
+    case .band:     return a.band.rawValue != b.band.rawValue ? a.band.rawValue < b.band.rawValue : a.rssi > b.rssi
+    case .width:    return a.widthMHz != b.widthMHz ? a.widthMHz > b.widthMHz : a.rssi > b.rssi
+    case .security: return a.security != b.security ? a.security < b.security : a.rssi > b.rssi
     }
+}
+
+func sortNets(_ nets: [BSS], by key: SortKey, ascending: Bool) -> [BSS] {
+    let sorted = nets.sorted { netBefore($0, $1, by: key) }
     return ascending ? sorted.reversed() : sorted
 }
 
@@ -256,7 +265,9 @@ func lerpRGB(_ x: Double, _ stops: [(at: Double, rgb: RGB)]) -> RGB {
     for i in 1..<stops.count {
         let lo = stops[i - 1], hi = stops[i]
         if x <= hi.at {
-            let t = hi.at == lo.at ? 0 : (x - lo.at) / (hi.at - lo.at)
+            // We only reach segment i once x has cleared every earlier stop, so
+            // lo.at < x ≤ hi.at here ⇒ hi.at > lo.at strictly ⇒ the divide is safe.
+            let t = (x - lo.at) / (hi.at - lo.at)
             return (Int((Double(lo.rgb.r) + t * Double(hi.rgb.r - lo.rgb.r)).rounded()),
                     Int((Double(lo.rgb.g) + t * Double(hi.rgb.g - lo.rgb.g)).rounded()),
                     Int((Double(lo.rgb.b) + t * Double(hi.rgb.b - lo.rgb.b)).rounded()))
@@ -357,8 +368,9 @@ func bandColorCode(_ b: Band) -> Int {
 
 /// Approximate East-Asian display width of a single Character (0/1/2 cells).
 func charDisplayWidth(_ c: Character) -> Int {
-    guard let s = c.unicodeScalars.first else { return 0 }
-    let v = s.value
+    // A Character is a grapheme cluster of ≥1 scalar, so .first is never nil; the
+    // base (first) scalar decides the cell width.
+    let v = c.unicodeScalars.first!.value
     if v == 0 { return 0 }
     // Combining marks / zero-width.
     if (0x0300...0x036F).contains(v) || (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-coverage:
+    name: build · test · 100% coverage
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift toolchain
+        run: swift --version
+
+      # Compiles the whole app — Core.swift plus main.swift and its CoreWLAN /
+      # CoreLocation links — so a break in the framework-facing code fails CI too.
+      - name: Build
+        run: swift build
+
+      # Fast, uninstrumented run of the dependency-free core unit tests.
+      - name: Unit tests
+        run: make test
+
+      # Re-runs the tests under llvm-cov instrumentation and fails unless Core.swift
+      # is at 100% region + line coverage (scripts/check-coverage.sh).
+      - name: Coverage gate (Core.swift = 100%)
+        run: make coverage

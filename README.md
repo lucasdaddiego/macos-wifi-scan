@@ -1,5 +1,6 @@
 # wifiscan
 
+[![CI](https://github.com/lucasdaddiego/macos-wifi-scan/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasdaddiego/macos-wifi-scan/actions/workflows/ci.yml)
 ![platform](https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple)
 ![language](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
@@ -372,9 +373,11 @@ is in the commit history.
 ```
 Sources/wifiscan/Core.swift   pure logic — channel plan · bonding · congestion · sorting · text layout
 Sources/wifiscan/main.swift   CoreWLAN/CoreLocation · TUI · out-of-process scan helper · entrypoint
-Tests/CoreTests.swift         dependency-free unit tests for Core (`make test`)
+Tests/CoreTests.swift         dependency-free unit tests for Core (`make test`, 100% covered)
+scripts/check-coverage.sh     coverage gate — fails unless Core.swift is 100% region+line covered
+.github/workflows/ci.yml      GitHub Actions: build + test + coverage gate on every push/PR
 Info.plist                    app-bundle metadata + Location-Services usage string
-Makefile                      `make` → signed wifiscan.app in ~/Applications + launcher; `make test`
+Makefile                      `make` → signed wifiscan.app in ~/Applications + launcher; `make test` / `make coverage`
 Package.swift                 SwiftPM manifest (for editors/tooling; `make` uses swiftc)
 Makefile.local                optional, git-ignored: machine-local SIGN identity
 ```
@@ -387,6 +390,7 @@ No third‑party dependencies — just the system **CoreWLAN**, **CoreLocation**
 ```sh
 make                       # build + sign + deploy
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
+make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
 swiftc Sources/wifiscan/Core.swift Sources/wifiscan/main.swift -o /tmp/wifiscan \
     -framework CoreWLAN -framework CoreLocation     # quick type-check / compile
 wifiscan --diag            # verify scanning + permission
@@ -397,6 +401,12 @@ bonding model, congestion scoring, sorting, text layout) and is unit‑tested
 standalone via `make test`; **`main.swift`** holds `Scanner` (CoreWLAN wrapper),
 `HelperClient` / `ScanDaemon` (the persistent out‑of‑process scan), and the
 raw‑mode TUI (`enterRaw` / `draw` / `runInteractive`).
+
+`Core.swift` is held at **100% region + line coverage** — `make coverage` (and CI,
+on every push/PR) re‑runs the tests under `llvm-cov` and `scripts/check-coverage.sh`
+fails the build on any uncovered line. The split is deliberate: all branchy logic
+lives in `Core.swift` so it's covered without the system frameworks, while
+`main.swift` is kept to thin, framework‑bound plumbing.
 
 ## License
 

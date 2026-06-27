@@ -11,10 +11,13 @@
 -include Makefile.local
 
 BINARY      := wifiscan
-# Core.swift = pure, framework-free logic (also compiled standalone by `make test`);
-# main.swift = CoreWLAN/CoreLocation, TUI, scan helper, entrypoint.
-SRC         := Sources/wifiscan/Core.swift Sources/wifiscan/main.swift
-TEST_SRC    := Sources/wifiscan/Core.swift Tests/CoreTests.swift
+# Core.swift = pure, framework-free logic (also compiled standalone by `make test`
+# and held at 100% coverage by `make coverage`); main.swift = CoreWLAN/CoreLocation,
+# TUI, scan helper, entrypoint.
+CORE        := Sources/wifiscan/Core.swift
+SRC         := $(CORE) Sources/wifiscan/main.swift
+TEST_SRC    := $(CORE) Tests/CoreTests.swift
+COV_DIR     := .build/coverage
 PLIST       := Info.plist
 INSTALL_DIR := $(HOME)/.bin
 APP_DIR     := $(HOME)/Applications
@@ -36,7 +39,7 @@ RELEASE     := -O -Xlinker -x -Xlinker -dead_strip
 LSREGISTER  := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 .DEFAULT_GOAL := deploy
-.PHONY: deploy clean test
+.PHONY: deploy clean test coverage
 
 deploy: ## Build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.bin
 	@rm -rf "$(APP)"
@@ -57,6 +60,14 @@ deploy: ## Build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.
 test: ## Build & run the dependency-free core unit tests (no Xcode/XCTest needed)
 	@swiftc -parse-as-library $(TEST_SRC) -o /tmp/wifiscan-tests
 	@/tmp/wifiscan-tests
+
+coverage: ## Run the core tests under coverage; fail unless Core.swift is 100% covered
+	@mkdir -p "$(COV_DIR)"
+	@swiftc -profile-generate -profile-coverage-mapping -parse-as-library $(TEST_SRC) -o "$(COV_DIR)/tests"
+	@LLVM_PROFILE_FILE="$(COV_DIR)/tests.profraw" "$(COV_DIR)/tests"
+	@xcrun llvm-profdata merge -sparse "$(COV_DIR)/tests.profraw" -o "$(COV_DIR)/tests.profdata"
+	@xcrun llvm-cov report "$(COV_DIR)/tests" -instr-profile="$(COV_DIR)/tests.profdata" $(CORE)
+	@bash scripts/check-coverage.sh "$(COV_DIR)/tests" "$(COV_DIR)/tests.profdata" $(CORE)
 
 clean: ## Remove the app bundle and the launcher
 	rm -rf "$(APP)" "$(INSTALL_DIR)/$(BINARY)"
