@@ -38,10 +38,10 @@ RELEASE     := -O -Xlinker -x -Xlinker -dead_strip
 
 LSREGISTER  := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-.DEFAULT_GOAL := deploy
-.PHONY: deploy clean test coverage
+.DEFAULT_GOAL := install
+.PHONY: install clean test coverage
 
-deploy: ## Build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.bin
+install: ## Build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.bin
 	@rm -rf "$(APP)"
 	@mkdir -p "$(APP)/Contents/MacOS" "$(INSTALL_DIR)"
 	cp $(PLIST) "$(APP)/Contents/Info.plist"
@@ -49,7 +49,7 @@ deploy: ## Build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.
 	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) "$(APP)"
 	ln -sf "$(EXE)" "$(INSTALL_DIR)/$(BINARY)"
 	-$(LSREGISTER) -f "$(APP)"
-	@echo "deployed $(APP) ($$(du -sh "$(APP)" | cut -f1))"
+	@echo "installed $(APP) ($$(du -sh "$(APP)" | cut -f1))"
 	@echo "         launcher: $(INSTALL_DIR)/$(BINARY) -> in-bundle binary"
 	@echo
 	@echo "one-time permission:"

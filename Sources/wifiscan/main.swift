@@ -261,7 +261,10 @@ private func renderTable(_ nets: [BSS], cols: Int, connSSID: String?, history: [
         // The connected network glows in the accent colour; others use the usual
         // value/dim tints. A leading "▸" marks it without disturbing column widths
         // (it replaces the first cell of the SSID field, which padTo reserves).
-        let ssidText = connected ? "▸ " + n.ssid : n.ssid
+        // sanitizeSSID neutralises any terminal escapes a hostile AP put in its name
+        // (the connected-match test above compares the raw name, so it's unaffected).
+        let safeName = sanitizeSSID(n.ssid)
+        let ssidText = connected ? "▸ " + safeName : safeName
         let ssid = connected
             ? Ansi.bold(Ansi.fg256(padTo(ssidText, wSSID), Pal.accent))
             : Ansi.fg256(padTo(ssidText, wSSID), n.hidden ? Pal.label : Pal.value)
@@ -692,7 +695,7 @@ func draw(_ app: App) {
     let lastStr = snap.last.map { timeFormatter.string(from: $0) } ?? "—"
     let head1 = Ansi.bg256(Ansi.bold(Ansi.fg256("  wifiscan  ", Pal.badgeFg)), Pal.badgeBg)
         + " " + Ansi.fg256("iface ", Pal.label) + Ansi.fg256(snap.iface, Pal.value)
-        + Ansi.fg256("  connected ", Pal.label) + Ansi.fg256(snap.conn ?? "—", Pal.value)
+        + Ansi.fg256("  connected ", Pal.label) + Ansi.fg256(snap.conn.map(sanitizeSSID) ?? "—", Pal.value)
         + Ansi.fg256("  location ", Pal.label)
         + Ansi.fg256(snap.loc, snap.loc == "authorized" ? Pal.accent : Pal.warn)
         + scanningTag
@@ -795,7 +798,7 @@ func runDiag(app: App) {
     print("wifiscan diagnostics")
     print("  interface          : \(s.interfaceName)")
     print("  power on           : \(s.powerOn)")
-    print("  connected ssid     : \(s.currentSSID ?? "—")")
+    print("  connected ssid     : \(s.currentSSID.map(sanitizeSSID) ?? "—")")
     print("  helper location    : \(res.status ?? "unknown")")
     print("  scan error         : \(res.error ?? "none")")
     print("  networks found     : \(res.nets.count)")
@@ -829,7 +832,7 @@ func runOnce(app: App, json: Bool) {
         if let e = result.error { FileHandle.standardError.write(Data("scan error: \(e)\n".utf8)) }
         return
     }
-    print(Ansi.bold("wifiscan — \(nets.count) networks  (iface \(app.scanner.interfaceName), connected \(app.scanner.currentSSID ?? "—"))"))
+    print(Ansi.bold("wifiscan — \(nets.count) networks  (iface \(app.scanner.interfaceName), connected \(app.scanner.currentSSID.map(sanitizeSSID) ?? "—"))"))
     if let e = result.error { print(Ansi.fg256("scan error: \(e)", Pal.error)) }
     if !nets.isEmpty && result.status != "authorized" && nets.contains(where: { $0.hidden }) {
         print(Ansi.fg256("⚠ SSIDs hidden — enable 'wifiscan' in System Settings → Privacy & Security → Location Services.", Pal.warn))

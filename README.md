@@ -388,7 +388,7 @@ No third‑party dependencies — just the system **CoreWLAN**, **CoreLocation**
 ## Development
 
 ```sh
-make                       # build + sign + deploy
+make                       # build + sign + install (≡ make install)
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
 make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
 swiftc Sources/wifiscan/Core.swift Sources/wifiscan/main.swift -o /tmp/wifiscan \
@@ -397,8 +397,9 @@ wifiscan --diag            # verify scanning + permission
 ```
 
 Two files: **`Core.swift`** holds the pure, framework‑free logic (channel plan,
-bonding model, congestion scoring, sorting, text layout) and is unit‑tested
-standalone via `make test`; **`main.swift`** holds `Scanner` (CoreWLAN wrapper),
+bonding model, congestion scoring, sorting, text layout, and terminal‑escape
+sanitization of hostile SSIDs) and is unit‑tested standalone via `make test`;
+**`main.swift`** holds `Scanner` (CoreWLAN wrapper),
 `HelperClient` / `ScanDaemon` (the persistent out‑of‑process scan), and the
 raw‑mode TUI (`enterRaw` / `draw` / `runInteractive`).
 

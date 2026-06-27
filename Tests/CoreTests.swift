@@ -39,6 +39,7 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         testGradients()
         testBars()
         testLayout()
+        testSanitize()
 
         print("\(checks - failures)/\(checks) checks passed")
         exit(failures == 0 ? 0 : 1)
@@ -320,5 +321,22 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(padLeft("hello", 3), "hel", "padLeft truncates over-long to width")
         eq(displayWidth(padLeft("你", 3)), 3, "padLeft wide char fills to width")
         eq(displayWidth(padLeft("你好", 3)), 3, "padLeft truncates wide without overflow")
+    }
+
+    // MARK: Terminal-safe SSID display
+
+    static func testSanitize() {
+        eq(sanitizeSSID("home-wifi"), "home-wifi", "printable name unchanged")
+        eq(sanitizeSSID(""), "", "empty name stays empty")
+        eq(sanitizeSSID("café 你好 😀"), "café 你好 😀", "Unicode printable names pass through")
+        eq(sanitizeSSID("‹hidden›"), "‹hidden›", "the hidden marker is left intact")
+        // An ANSI-escape attack: the ESC (C0) is replaced; the now-inert "[31m" stays
+        // as plain text and can no longer recolour the terminal.
+        eq(sanitizeSSID("evil\u{1B}[31mAP"), "evil·[31mAP", "ESC neutralised to placeholder")
+        eq(sanitizeSSID("a\tb\nc\rd"), "a·b·c·d", "TAB / LF / CR neutralised")    // C0 < 0x20
+        eq(sanitizeSSID("x\u{7F}y"), "x·y", "DEL (0x7F) neutralised")
+        eq(sanitizeSSID("x\u{85}y"), "x·y", "C1 control (NEL, 0x85) neutralised")  // 0x80…0x9F
+        // Width preservation keeps table columns aligned regardless of escapes.
+        eq(displayWidth(sanitizeSSID("a\u{1B}\u{7F}b")), 4, "sanitised name keeps display width")
     }
 }

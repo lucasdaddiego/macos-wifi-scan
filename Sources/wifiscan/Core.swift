@@ -413,3 +413,30 @@ func padLeft(_ s: String, _ n: Int) -> String {
     let t = truncateToWidth(s, n)
     return String(repeating: " ", count: max(0, n - displayWidth(t))) + t
 }
+
+// MARK: - Terminal-safe SSID display
+//
+// SSIDs arrive from the radio as arbitrary bytes — a hostile access point can name
+// itself with ANSI escape sequences, carriage returns, etc. Printing such a name raw
+// would let it move the cursor, recolour or clear the terminal, or corrupt the table
+// layout. So every SSID is run through sanitizeSSID before it reaches the screen.
+// (One-shot JSON output keeps the raw name: JSONEncoder escapes control bytes, so the
+// JSON stays valid and inert until a consumer chooses to render it.)
+
+/// Replace C0 control characters (incl. ESC, CR, LF, TAB), DEL, and C1 controls with a
+/// visible middle-dot placeholder. Width-preserving — one display cell per replaced
+/// scalar — so table columns stay aligned. Printable text (including the `‹hidden›`
+/// marker and CJK/emoji names) passes through untouched.
+func sanitizeSSID(_ s: String) -> String {
+    let placeholder: Unicode.Scalar = "\u{00B7}"      // · — unambiguously one cell wide
+    var out = String.UnicodeScalarView()
+    for scalar in s.unicodeScalars {
+        let v = scalar.value
+        if v < 0x20 || v == 0x7F || (0x80...0x9F).contains(v) {
+            out.append(placeholder)
+        } else {
+            out.append(scalar)
+        }
+    }
+    return String(out)
+}
