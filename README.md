@@ -97,6 +97,8 @@ so it works on the latest macOS with nothing to install.
 ## Install
 
 ```sh
+git clone https://github.com/lucasdaddiego/wifiscan.git
+cd wifiscan
 make            # build wifiscan.app into ~/Applications + a `wifiscan` launcher on ~/.bin
 make clean      # remove both
 ```
