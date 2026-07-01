@@ -35,7 +35,7 @@ third‑party packages.
    5 GHz     ch 36 (1ap)  ch 40 (1ap)   ch 44 (2ap)    non-DFS (preferred)
              ch 100 (0ap) ch 104 (0ap)  ch 108 (0ap)   DFS* — cleaner, but may drop on radar
  ────────────────────────────────────────────────────────────────────────────────────────
- [q]uit  [r]escan  [g]raph  [a]uto  [p]ower [s]nr [c]han [n]ame [w]idth s[e]c  [b]and 1/2/6/0  [j/k]scroll  [+/-]interval
+ [q]uit  [?]help  [r]escan  [g]raph  [a]uto  sort p/s/c/n/w/e/[l]oad  [b]and 1/2/6/0  j/k u/d scroll  [+/-]interval
 ```
 
 ## Contents
@@ -50,6 +50,7 @@ third‑party packages.
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [The channel map](#the-channel-map)
 - [How recommendations work](#how-recommendations-work)
+- [Survey over time](#survey-over-time)
 - [JSON output](#json-output)
 - [How it reveals SSIDs (the macOS‑26 catch)](#how-it-reveals-ssids-the-macos26-catch)
 - [Architecture](#architecture)
@@ -62,14 +63,20 @@ third‑party packages.
 ## Features
 
 - **Full neighbour survey** — SSID, RSSI (dBm), SNR, channel, band (2.4 / 5 / 6 GHz),
-  channel width (20/40/80/160 MHz) and security (Open / WEP / WPA / WPA2 / WPA3 /
-  transition).
-- **Sort by any column** live — power, SNR, channel, name, band, width, security;
-  press a key again to reverse.
+  channel width (20/40/80/160/320 MHz), security (Open / WEP / WPA / WPA2 / WPA3 /
+  transition) and **QBSS channel load** (the AP's own airtime‑utilisation broadcast,
+  when present).
+- **Sort by any column** live — power, SNR, channel, name, band, width, security,
+  load; press a key again to reverse.
 - **Channel‑congestion map** — a power‑weighted occupancy bar per channel, per band,
   that accounts for channel‑bonding overlap.
-- **"Cleanest channel" recommendations** per band, using energy‑weighted
-  interference scoring (not just AP counts).
+- **"Cleanest channel" recommendations** per band — energy‑weighted interference
+  scoring with partial‑overlap fractions and QBSS airtime, **your own APs excluded**
+  (connected SSID automatically, more via `--exclude-ssid`), with **dB margins** so
+  you can see whether the runner‑up actually matters.
+- **Survey over time** — `--log` appends every scan to a JSONL file; `--report`
+  aggregates it into the cleanest channel **per hour of day** plus a minimax
+  all‑day pick (congestion at 9 pm ≠ congestion at 4 am).
 - **Colour‑coded signal** bars and dBm, from bright‑green (excellent) to red (poor) —
   a smooth **24‑bit gradient** with **sub‑cell (⅛‑block) bars** on truecolor terminals
   (Ghostty, iTerm, kitty …), gracefully falling back to a 256‑colour palette elsewhere.
@@ -77,8 +84,11 @@ third‑party packages.
   (wheel‑scroll, click a header to sort) and a live **window/tab title**; all auto‑gated,
   so dumb terminals and pipes still work.
 - **Live auto‑refresh** with adjustable interval, plus on‑demand rescan.
-- **Band filters** (2.4 / 5 / 6 GHz / all) and scrolling for crowded areas.
-- **Scriptable** — `--once`, `--json` (pipe into `jq`), and `--diag` modes.
+- **Band filters** (2.4 / 5 / 6 GHz / all), scrolling and paging for crowded areas,
+  a `?` help overlay, and view settings that **persist across runs**
+  (`~/.config/wifiscan/config.json`).
+- **Scriptable** — `--once`, `--json` (pipe into `jq`), `--diag`, `--log`/`--report`,
+  `--band`, `--sort`.
 - **Single static binary**, packaged as a signed `.app`; **zero dependencies**.
 
 ## Why a custom tool?
@@ -153,11 +163,13 @@ setup.)
 ## Usage
 
 ```sh
-wifiscan                  # interactive TUI (default)
-wifiscan --once           # one scan: table + channel map + recommendations, then exit
-wifiscan --json           # one scan as JSON on stdout (pipe into jq, etc.)
-wifiscan --diag           # scan + permission diagnostics
-wifiscan --help           # usage summary
+wifiscan                            # interactive TUI (default)
+wifiscan --once                     # one scan: table + channel map + recommendations, then exit
+wifiscan --json                     # one scan as JSON on stdout (pipe into jq, etc.)
+wifiscan --diag                     # scan + permission diagnostics
+wifiscan --log ~/wifi-survey.jsonl  # TUI as usual, but append every scan to a survey log
+wifiscan --report ~/wifi-survey.jsonl   # aggregate that log: cleanest channel by hour
+wifiscan --help                     # usage summary
 ```
 
 | Flag | Description |
@@ -165,11 +177,17 @@ wifiscan --help           # usage summary
 | `--once` | Single scan; print the table, channel map and recommendations, then exit. |
 | `--json` | Single scan; emit a JSON array on stdout. |
 | `--diag` | Print interface, permission status, network/SSID counts and the app bundle path. |
+| `--band 2.4\|5\|6\|all` | Filter to one band (initial TUI filter, or the one‑shot output). |
+| `--sort key` | Initial sort: `power`, `snr`, `channel`, `name`, `band`, `width`, `security`, `load`. |
+| `--exclude-ssid a[,b]` | Keep your own network(s) out of the recommendation model. The connected SSID is always excluded. |
+| `--log file` | Append every completed scan to `file` as JSONL (works in TUI and one‑shot modes). |
+| `--report file` | Read a `--log` file and print the cleanest channel per hour of day + an all‑day pick, per band. |
 | `--help`, `-h` | Show usage. |
 
-That's the whole flag surface — everything else is a **live** TUI control. Sort
-column, band filter and refresh interval are changed with keys while running (see
-[keyboard shortcuts](#keyboard-shortcuts)), and **colour is automatic**: on in a
+Everything else is a **live** TUI control. Sort column, band filter and refresh
+interval are changed with keys while running (see
+[keyboard shortcuts](#keyboard-shortcuts)) and are **remembered across runs** in
+`~/.config/wifiscan/config.json` (flags override). **Colour is automatic**: on in a
 terminal, off when piped or redirected. Set `NO_COLOR` to force it off. **Truecolor**
 is used when the terminal advertises it (`COLORTERM=truecolor`, as Ghostty/iTerm/kitty
 do); otherwise the 256‑colour palette is used.
@@ -185,6 +203,7 @@ do); otherwise the 256‑colour palette is used.
 | **dBm** | RSSI / signal power. Closer to 0 is stronger (e.g. `-45` ≫ `-85`). |
 | **Signal** | Colour bar of the same value. |
 | **SNR** | Signal‑to‑noise ratio in dB — only shown for the channel your radio is tuned to (see [limitations](#known-macos-limitations)); `—` otherwise. |
+| **Load** | The AP's own **QBSS airtime utilisation** broadcast (`42%` = its channel is busy 42% of the time), green → red. `—` when the AP doesn't broadcast it. RSSI says *loud*; this says *busy*. Shown on wide terminals. |
 | **Sec** | Security: `Open`, `WEP`, `WPA`, `WPA2`, `WPA3`, or `WPA2/3` (transition). |
 | **Trend** | Sparkline of recent RSSI samples (last ~12 refreshes), so you can see a signal drifting or fluctuating at a glance. Shown on wide terminals only. |
 
@@ -196,14 +215,16 @@ gradient rather than five steps.
 
 | Key | Action | | Key | Action |
 |-----|--------|-|-----|--------|
-| `q` / `Ctrl‑C` / `Ctrl‑D` | quit | | `p` | sort by **p**ower |
-| `r` | **r**escan now | | `s` | sort by **S**NR |
-| `g` / `Tab` | toggle **g**raph (channel map) | | `c` | sort by **c**hannel |
-| `a` | toggle **a**uto‑refresh | | `n` | sort by **n**ame |
-| `b` | cycle **b**and filter | | `w` | sort by **w**idth |
-| `1` / `2` / `6` | filter to 2.4 / 5 / 6 GHz | | `e` | sort by s**e**curity |
+| `q` / `Esc` / `Ctrl‑C` / `Ctrl‑D` | quit | | `p` | sort by **p**ower |
+| `?` | help overlay (any key closes) | | `s` | sort by **S**NR |
+| `r` | **r**escan now | | `c` | sort by **c**hannel |
+| `g` / `Tab` | toggle **g**raph (channel map) | | `n` | sort by **n**ame |
+| `a` | toggle **a**uto‑refresh | | `w` | sort by **w**idth |
+| `b` | cycle **b**and filter | | `e` | sort by s**e**curity |
+| `1` / `2` / `6` | filter to 2.4 / 5 / 6 GHz | | `l` | sort by **l**oad (QBSS airtime) |
 | `0` | show all bands | | `j` / `k` | scroll down / up |
-| `+` / `-` | refresh interval ± 1s | | | press a sort key again to reverse |
+| `+` / `-` | refresh interval ± 1s | | `u` / `d` / `Space` | scroll 10 lines |
+| | | | | press a sort key again to reverse |
 
 ### Mouse
 
@@ -240,26 +261,65 @@ subject to radar detection.
 ## How recommendations work
 
 1. Each AP is mapped to the **frequency span** it actually occupies, accounting for
-   20 / 40 / 80 / 160 MHz channel bonding — standard 5 GHz bonded groups, the
+   20 / 40 / 80 / 160 / 320 MHz channel bonding — standard 5 GHz bonded groups, the
    regular 6 GHz grid, and centre‑frequency overlap for 2.4 GHz.
 2. For each candidate channel, `wifiscan` sums the **linear power** (`10^(RSSI/10)`)
-   of every AP whose span overlaps it. A strong nearby AP therefore counts far more
-   than a weak distant one — better than naïve "AP count" tools.
-3. The channel with the **least overlapping energy** wins.
+   of every overlapping AP, scaled by the **fraction of its spectrum that actually
+   lands on the candidate** (an 80 MHz AP spreads its energy, so a 20 MHz slot
+   inside it sees a quarter; a 2.4 GHz AP two channels over counts half). A strong
+   nearby AP therefore counts far more than a weak distant one — better than naïve
+   "AP count" tools.
+3. When an AP broadcasts **QBSS airtime utilisation**, its contribution is scaled by
+   how busy it actually is (floored at 10% — an idle AP still beacons and can wake
+   up). APs that don't broadcast it are assumed busy.
+4. **Your own networks are excluded** — the connected SSID automatically, others via
+   `--exclude-ssid`. Moving your AP moves its energy with it, so counting it would
+   bias the recommendation away from wherever your AP currently sits. The heading
+   shows what was ignored.
+5. The channel with the **least overlapping energy** wins. Runners‑up carry a
+   **`+N dB` margin** (`+3dB` ≈ twice the interfering energy), so you can tell
+   "effectively tied" from "clearly worse".
 
 Per band:
 
 - **2.4 GHz** → only ever recommends **1 / 6 / 11** (the non‑overlapping set).
-- **5 GHz** → best **non‑DFS** channel (`36/40/44/48/149/153/157/161`), plus the
+- **5 GHz** → best **non‑DFS** channel (`36/40/44/48/149/153/157/161/165`), plus the
   cleanest **DFS** option marked `*` (cleaner, but can momentarily drop on radar
   detection).
 - **6 GHz** → **PSC** (Preferred Scanning Channels): `5/21/37/…/229`.
+
+## Survey over time
+
+Channel congestion is time‑of‑day dependent — the channel that looks clean during a
+lunchtime scan may be slammed at 9 pm. To plan on real data:
+
+```sh
+wifiscan --log ~/wifi-survey.jsonl          # leave the TUI running; every scan appends
+wifiscan --once --log ~/wifi-survey.jsonl   # or cron a one-shot every 15 min
+wifiscan --report ~/wifi-survey.jsonl       # then aggregate
+```
+
+The report shows, per band, the cleanest candidate for **each hour of day** with its
+average interference level, and an **all‑day pick** — the channel whose *worst* hour
+is least bad (minimax), i.e. the safe set‑and‑forget choice:
+
+```
+▎ 5 GHz  (non-DFS)
+   08:00  ch 149    clean  (12 scans)
+   13:00  ch 149   -78dBm  (10 scans)
+   21:00  ch 40    -71dBm  (14 scans)
+  all-day pick: ch 149  (worst hour -78dBm)
+```
+
+Each log line is one JSON object (`ts` epoch seconds + the networks seen), so the
+file is also easy to post‑process with `jq`.
 
 ## JSON output
 
 `wifiscan --json` prints a pretty array, sorted by signal power (strongest first);
 object keys are alphabetised. `noise` and `snr` are present only when macOS actually
-measured them (otherwise omitted):
+measured them, and `utilization` (QBSS airtime, 0…1) only when the AP broadcasts it
+(otherwise omitted):
 
 ```jsonc
 [

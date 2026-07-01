@@ -64,7 +64,8 @@ final class Scanner {
                     band: Band.from(ch?.channelBand.rawValue ?? 0),
                     widthMHz: widthCodeToMHz(ch?.channelWidth.rawValue ?? 0),
                     security: Scanner.securityLabel(n),
-                    hidden: (n.ssid?.isEmpty != false)
+                    hidden: (n.ssid?.isEmpty != false),
+                    utilization: qbssUtilization(n.informationElementData)
                 )
             }
             return (nets, nil)
@@ -211,15 +212,16 @@ func bandFilterLabel(_ b: Band?) -> String { b?.longLabel ?? "All bands" }
 
 /// Table column widths (responsive-ish; SSID flexes to fill). Shared by renderTable
 /// and tableSortRegions so the on-screen layout and the mouse hit-test can't drift.
-/// The Trend (sparkline) column only appears once the window is wide enough to spare
-/// the room, so narrow terminals lose nothing.
-private func tableColWidths(_ cols: Int) -> (ssid: Int, chan: Int, band: Int, width: Int, sig: Int, bar: Int, snr: Int, sec: Int, trend: Int) {
+/// The Load (QBSS airtime) and Trend (sparkline) columns only appear once the window
+/// is wide enough to spare the room, so narrow terminals lose nothing.
+private func tableColWidths(_ cols: Int) -> (ssid: Int, chan: Int, band: Int, width: Int, sig: Int, bar: Int, snr: Int, util: Int, sec: Int, trend: Int) {
     let chan = 7, band = 5, width = 6, sig = 6, bar = 11, snr = 5, sec = 7
+    let util = cols >= 84 ? 5 : 0                        // QBSS airtime column
     let trend = cols >= 96 ? App.historyLen : 0          // sparkline column, wide screens only
-    let nCols = trend > 0 ? 9 : 8
-    let fixed = chan + band + width + sig + bar + snr + sec + trend + (nCols - 1) // gaps
+    let nCols = 8 + (util > 0 ? 1 : 0) + (trend > 0 ? 1 : 0)
+    let fixed = chan + band + width + sig + bar + snr + util + sec + trend + (nCols - 1) // gaps
     let ssid = max(14, min(32, cols - fixed))
-    return (ssid, chan, band, width, sig, bar, snr, sec, trend)
+    return (ssid, chan, band, width, sig, bar, snr, util, sec, trend)
 }
 
 /// x-ranges (1-based screen columns) of each header cell paired with the sort key a
@@ -229,8 +231,10 @@ func tableSortRegions(_ cols: Int) -> [(range: ClosedRange<Int>, key: SortKey)] 
     let w = tableColWidths(cols)
     var order: [(Int, SortKey)] = [
         (w.ssid, .name), (w.chan, .channel), (w.band, .band), (w.width, .width),
-        (w.sig, .power), (w.bar, .power), (w.snr, .snr), (w.sec, .security),
+        (w.sig, .power), (w.bar, .power), (w.snr, .snr),
     ]
+    if w.util > 0 { order.append((w.util, .util)) }
+    order.append((w.sec, .security))
     if w.trend > 0 { order.append((w.trend, .power)) }
     var regions: [(range: ClosedRange<Int>, key: SortKey)] = []
     var x = 1
@@ -243,14 +247,16 @@ func tableSortRegions(_ cols: Int) -> [(range: ClosedRange<Int>, key: SortKey)] 
 
 private func renderTable(_ nets: [BSS], cols: Int, connSSID: String?, history: [String: [Int]]) -> [String] {
     let w = tableColWidths(cols)
-    let (wSSID, wChan, wBand, wWidth, wSig, wBar, wSnr, wSec, wTrend) = (w.ssid, w.chan, w.band, w.width, w.sig, w.bar, w.snr, w.sec, w.trend)
+    let (wSSID, wChan, wBand, wWidth, wSig, wBar, wSnr, wUtil, wSec, wTrend) = (w.ssid, w.chan, w.band, w.width, w.sig, w.bar, w.snr, w.util, w.sec, w.trend)
     var out: [String] = []
 
     var headerCells = [
         padTo("SSID", wSSID), padLeft("Chan", wChan), padTo("Band", wBand),
         padLeft("Width", wWidth), padLeft("dBm", wSig), padTo("Signal", wBar),
-        padLeft("SNR", wSnr), padTo("Sec", wSec),
+        padLeft("SNR", wSnr),
     ]
+    if wUtil > 0 { headerCells.append(padLeft("Load", wUtil)) }
+    headerCells.append(padTo("Sec", wSec))
     if wTrend > 0 { headerCells.append(padTo("Trend", wTrend)) }
     out.append(Ansi.bold(Ansi.fg256(headerCells.joined(separator: " "), Pal.text)))
 
@@ -277,7 +283,15 @@ private func renderTable(_ nets: [BSS], cols: Int, connSSID: String?, history: [
         let bar = Ansi.signalBar(n.rssi, width: wBar - 1) + " "
         let snr = padLeft(snrStr, wSnr)
         let sec = padTo(n.security, wSec)
-        var cells = [ssid, chan, band, padLeft(widthStr, wWidth), dbm, bar, snr, sec]
+        var cells = [ssid, chan, band, padLeft(widthStr, wWidth), dbm, bar, snr]
+        if wUtil > 0 {
+            // QBSS airtime, coloured like the channel map (green quiet → red busy).
+            let cell = n.utilization.map {
+                Ansi.congestionColored(padLeft("\(Int(($0 * 100).rounded()))%", wUtil), $0)
+            } ?? Ansi.fg256(padLeft("—", wUtil), Pal.label)
+            cells.append(cell)
+        }
+        cells.append(sec)
         if wTrend > 0 {
             // Right-align the sparkline so the latest sample sits at the column edge;
             // colour it by the current signal so trend and strength read together.
@@ -323,9 +337,16 @@ private func renderGraph(_ nets: [BSS], cols: Int) -> [String] {
     return out
 }
 
-private func renderRecommendations(_ nets: [BSS]) -> [String] {
+private func renderRecommendations(_ nets: [BSS], excluding: Set<String>) -> [String] {
     var out: [String] = []
-    out.append(Ansi.bold(Ansi.fg256("Recommended clean channels", Pal.accent)))
+    var heading = Ansi.bold(Ansi.fg256("Recommended clean channels", Pal.accent))
+    // Say which of the user's networks were left out of the model, so a "clean"
+    // verdict on the channel their own AP occupies isn't a surprise.
+    let excluded = excluding.filter { x in nets.contains { $0.ssid == x } }.sorted()
+    if !excluded.isEmpty {
+        heading += Ansi.dim("  (ignoring your \(excluded.map(sanitizeSSID).joined(separator: ", ")))")
+    }
+    out.append(heading)
 
     func fmt(_ recs: [ChannelLoad], band: Band) -> String {
         guard let best = recs.first else { return Ansi.dim("—") }
@@ -333,7 +354,10 @@ private func renderRecommendations(_ nets: [BSS]) -> [String] {
         let allClear = recs.allSatisfy { $0.weighted == 0 && $0.apCount == 0 }
         return recs.prefix(3).map { r -> String in
             let dfs = (band == .ghz5 && ChannelPlan.isDFS(r.channel)) ? "*" : ""
-            let tag = "ch \(r.channel)\(dfs) (\(r.apCount)ap)"
+            // The margin says whether the runner-up actually matters: "+3dB" ≈ twice
+            // the interfering energy of the best pick.
+            let margin = loadMarginLabel(r.weighted, best: best.weighted).map { " \($0)" } ?? ""
+            let tag = "ch \(r.channel)\(dfs) (\(r.apCount)ap\(margin))"
             return (!allClear && r.channel == best.channel) ? Ansi.bold(Ansi.fg256(tag, Pal.best)) : Ansi.fg256(tag, Pal.text)
         }.joined(separator: "  ")
     }
@@ -342,17 +366,17 @@ private func renderRecommendations(_ nets: [BSS]) -> [String] {
     }
 
     if nets.contains(where: { $0.band == .ghz24 }) {
-        row("2.4 GHz", fmt(Analysis.recommend(nets, band: .ghz24, candidates: ChannelPlan.cand24), band: .ghz24),
+        row("2.4 GHz", fmt(Analysis.recommend(nets, band: .ghz24, candidates: ChannelPlan.cand24, excluding: excluding), band: .ghz24),
             "only 1/6/11 are non-overlapping")
     }
     if nets.contains(where: { $0.band == .ghz5 }) {
-        row("5 GHz", fmt(Analysis.recommend(nets, band: .ghz5, candidates: ChannelPlan.cand5NonDFS), band: .ghz5),
+        row("5 GHz", fmt(Analysis.recommend(nets, band: .ghz5, candidates: ChannelPlan.cand5NonDFS, excluding: excluding), band: .ghz5),
             "non-DFS (preferred)")
-        row("", fmt(Analysis.recommend(nets, band: .ghz5, candidates: ChannelPlan.cand5DFS), band: .ghz5),
+        row("", fmt(Analysis.recommend(nets, band: .ghz5, candidates: ChannelPlan.cand5DFS, excluding: excluding), band: .ghz5),
             "DFS* — cleaner, but may drop on radar")
     }
     if nets.contains(where: { $0.band == .ghz6 }) {
-        row("6 GHz", fmt(Analysis.recommend(nets, band: .ghz6, candidates: ChannelPlan.cand6PSC), band: .ghz6),
+        row("6 GHz", fmt(Analysis.recommend(nets, band: .ghz6, candidates: ChannelPlan.cand6PSC, excluding: excluding), band: .ghz6),
             "PSC channels")
     }
     return out
@@ -380,10 +404,24 @@ final class App {
     var ascending = false
     var bandFilter: Band? = nil
     var graphMode = false
+    var showHelp = false
     var autoRefresh = true
     var interval: TimeInterval = 6
     var scroll = 0
     var quit = false
+
+    // --- config (set once at startup, read-only afterwards) ---
+    var excludeSSIDs: Set<String> = []   // --exclude-ssid: your own APs, kept out of recommendations
+    var logPath: String?                 // --log: append every scan as survey JSONL
+
+    /// SSIDs kept out of the congestion/recommendation model: yours. The connected
+    /// network is always excluded — moving your own AP moves its energy with it, so
+    /// counting it would bias recommendations away from its current channel.
+    func effectiveExclusions(conn: String?) -> Set<String> {
+        var e = excludeSSIDs
+        if let c = conn { e.insert(c) }
+        return e
+    }
 
     // --- render frame cache (main-thread-confined) ---
     var lastFrame = ""
@@ -399,7 +437,9 @@ final class App {
 
     // --- per-network RSSI history for sparklines (guard with `lock`) ---
     static let historyLen = 12
+    static let graceMisses = 3     // scans a network may miss before its history drops
     var history: [String: [Int]] = [:]
+    var historyMiss: [String: Int] = [:]   // consecutive scans each key has been absent
     /// Copy the history under the lock for use on the main (render) thread.
     func historyCopy() -> [String: [Int]] { lock.lock(); defer { lock.unlock() }; return history }
     /// Lightweight locked read of the scanning latch (for the spinner animation).
@@ -428,20 +468,34 @@ final class App {
             defer { self.lock.lock(); self.scanning = false; self.lock.unlock() }
             let result = HelperClient.shared.scan()   // persistent open-launched helper so SSIDs are visible
             let iface = self.scanner.interfaceName
-            let conn = self.scanner.currentSSID
+            // The front-end may be denied the connected SSID (it isn't an app session
+            // under macOS 26's redaction rules); the helper always is — fall back to it.
+            let conn = self.scanner.currentSSID ?? result.conn
+            if result.error == nil, let path = self.logPath {
+                appendSurveyLog(path, nets: result.nets)
+            }
             self.lock.lock()
             if result.error == nil {
                 self.nets = result.nets
-                // Append this scan's RSSI to each network's ring buffer, then drop
-                // histories for networks that vanished — keeps the map bounded and the
-                // sparklines aligned to what's currently on screen.
+                // Append this scan's RSSI to each network's ring buffer. WiFi scans
+                // routinely miss a beacon, so an absent network keeps its history for
+                // graceMisses consecutive misses before it's dropped — one bad scan
+                // shouldn't wipe a stable neighbour's trend.
                 let live = Set(result.nets.map { netKey($0) })
-                self.history = self.history.filter { live.contains($0.key) }
+                for key in self.history.keys where !live.contains(key) {
+                    self.historyMiss[key, default: 0] += 1
+                    if self.historyMiss[key]! >= App.graceMisses {
+                        self.history[key] = nil
+                        self.historyMiss[key] = nil
+                    }
+                }
                 for n in result.nets {
-                    var h = self.history[netKey(n), default: []]
+                    let key = netKey(n)
+                    self.historyMiss[key] = nil
+                    var h = self.history[key, default: []]
                     h.append(n.rssi)
                     if h.count > App.historyLen { h.removeFirst(h.count - App.historyLen) }
-                    self.history[netKey(n)] = h
+                    self.history[key] = h
                 }
             }
             self.scanError = result.error
@@ -534,8 +588,9 @@ private func readInput() -> Input {
         return b < 0x80 ? .key(Character(UnicodeScalar(b))) : .none
     }
     // ESC: a lone Esc, an arrow/function key, or an SGR mouse report. Only CSI ("ESC [")
-    // carries mouse; anything else we drain and ignore.
-    guard let b1 = readByte() else { return .none }     // lone Esc
+    // carries mouse; anything else we drain and ignore. A lone Esc (nothing follows
+    // within VTIME) is a real keypress — surface it so it can quit / close help.
+    guard let b1 = readByte() else { return .key("\u{1B}") }
     guard b1 == 0x5B /* [ */ else { _ = readByte(); return .none }  // e.g. SS3 (ESC O …)
     // Drain the CSI body up to its final byte (0x40–0x7E). Draining the WHOLE sequence
     // — not a fixed byte count — is what keeps a mouse report's digits from leaking out
@@ -610,12 +665,16 @@ func runInteractive(app: App) {
         }
     }
     leaveRaw()
+    savePrefs(app)               // remember sort/filter/interval for next launch
     HelperClient.shared.shutdown()
 }
 
 func handleKey(_ k: Character, app: App) {
+    // The help overlay is modal-lite: whatever the key, just dismiss it.
+    if app.showHelp { app.showHelp = false; app.markDirty(); return }
     switch k {
-    case "q", "\u{04}", "\u{03}": app.quit = true        // q / Ctrl-D / Ctrl-C (ISIG is off)
+    case "q", "\u{1B}", "\u{04}", "\u{03}": app.quit = true  // q / Esc / Ctrl-D / Ctrl-C (ISIG is off)
+    case "?": app.showHelp = true; app.scroll = 0
     case "r": app.triggerScan()
     case "a": app.autoRefresh.toggle()
     case "g", "\t": app.graphMode.toggle(); app.scroll = 0
@@ -625,6 +684,7 @@ func handleKey(_ k: Character, app: App) {
     case "n": setSort(app, .name)
     case "w": setSort(app, .width)
     case "e": setSort(app, .security)
+    case "l": setSort(app, .util)
     case "b": cycleBand(app)
     case "1": app.bandFilter = .ghz24; app.scroll = 0
     case "2": app.bandFilter = .ghz5; app.scroll = 0
@@ -632,6 +692,8 @@ func handleKey(_ k: Character, app: App) {
     case "0": app.bandFilter = nil; app.scroll = 0
     case "j": app.scroll += 1
     case "k": app.scroll = max(0, app.scroll - 1)
+    case "d", " ": app.scroll += 10
+    case "u": app.scroll = max(0, app.scroll - 10)
     case "+", "=": app.interval = min(60, app.interval + 1)
     case "-", "_": app.interval = max(2, app.interval - 1)
     default: break
@@ -723,19 +785,21 @@ func draw(_ app: App) {
     }
 
     // Body
-    let recLines = renderRecommendations(snap.nets)
+    let recLines = renderRecommendations(snap.nets, excluding: app.effectiveExclusions(conn: snap.conn))
     let footer = footerLines()
     let chrome = lines.count + recLines.count + footer.count + 2
     let bodyBudget = max(3, layout.rows - chrome)
 
     var body: [String]
-    if app.graphMode {
+    if app.showHelp {
+        body = helpOverlayLines()
+    } else if app.graphMode {
         body = renderGraph(visible, cols: layout.cols)
     } else {
         body = renderTable(visible, cols: layout.cols, connSSID: snap.conn, history: app.historyCopy())
     }
     // Scroll handling (keep header row when scrolling table).
-    let headerRow = (!app.graphMode && !body.isEmpty) ? body.removeFirst() : nil
+    let headerRow = (!app.graphMode && !app.showHelp && !body.isEmpty) ? body.removeFirst() : nil
     let maxScroll = max(0, body.count - bodyBudget + (headerRow != nil ? 1 : 0))
     if app.scroll > maxScroll { app.scroll = maxScroll }
     var bodyView = Array(body.dropFirst(app.scroll).prefix(bodyBudget - (headerRow != nil ? 1 : 0)))
@@ -751,7 +815,9 @@ func draw(_ app: App) {
         app.headerScreenRow = -1
     }
 
-    lines.append(contentsOf: bodyView)
+    // Clip EVERY body/recommendation line to the terminal width — an over-long row
+    // would wrap (DECAWM) and shear the whole frame on narrow windows.
+    lines.append(contentsOf: bodyView.map { clipAnsi($0, layout.cols) })
     // Pad the body region so the bottom chrome sits flush at the bottom. `used` must
     // count ALL trailing lines — the separator (+1), the recommendations, and the
     // footer — otherwise the assembled frame overshoots layout.rows by one and the
@@ -761,7 +827,7 @@ func draw(_ app: App) {
         lines.append(contentsOf: Array(repeating: "", count: layout.rows - used))
     }
     lines.append(Ansi.dim(String(repeating: "─", count: min(layout.cols, 120))))
-    lines.append(contentsOf: recLines)
+    lines.append(contentsOf: recLines.map { clipAnsi($0, layout.cols) })
     lines.append(contentsOf: footer.map { clipAnsi($0, layout.cols) })   // never wrap the layout
 
     // Paint. Clear each line to EOL rather than wiping the whole screen every frame
@@ -784,8 +850,32 @@ func draw(_ app: App) {
 }
 
 func footerLines() -> [String] {
-    let keys = "[q]uit  [r]escan  [g]raph  [a]uto  [p]ower [s]nr [c]han [n]ame [w]idth s[e]c  [b]and 1/2/6/0  [j/k]scroll  [+/-]interval  ·  mouse: wheel scrolls, click a header to sort"
+    let keys = "[q]uit  [?]help  [r]escan  [g]raph  [a]uto  sort p/s/c/n/w/e/[l]oad  [b]and 1/2/6/0  j/k u/d scroll  [+/-]interval  ·  wheel scrolls · click a header to sort"
     return [Ansi.dim(keys)]
+}
+
+/// The `?` key's overlay, rendered in place of the table/graph body.
+private func helpOverlayLines() -> [String] {
+    let rows: [(String, String)] = [
+        ("q · Esc · Ctrl-C", "quit"),
+        ("?", "toggle this help"),
+        ("r", "rescan now"),
+        ("a", "toggle auto-refresh"),
+        ("g / Tab", "toggle channel-map view"),
+        ("p s c n w e l", "sort: power · SNR · channel · name · width · security · load"),
+        ("(same key again)", "reverse the sort direction"),
+        ("b · 1 2 6 0", "cycle band · filter 2.4 / 5 / 6 / all"),
+        ("j k · u d · Space", "scroll: line · 10 lines · 10 lines down"),
+        ("+ / -", "auto-refresh interval"),
+        ("mouse", "wheel scrolls · click a column header to sort"),
+    ]
+    var out = [Ansi.bold(Ansi.fg256("Keys", Pal.heading)), ""]
+    for (k, v) in rows {
+        out.append("  " + Ansi.fg256(padTo(k, 20), Pal.accent) + Ansi.fg256(v, Pal.text))
+    }
+    out.append("")
+    out.append(Ansi.dim("  press any key to close"))
+    return out
 }
 
 // MARK: - Diagnostics
@@ -799,11 +889,17 @@ func runDiag(app: App) {
     print("  interface          : \(s.interfaceName)")
     print("  power on           : \(s.powerOn)")
     print("  connected ssid     : \(s.currentSSID.map(sanitizeSSID) ?? "—")")
+    print("  helper conn ssid   : \(res.conn.map(sanitizeSSID) ?? "—")")
     print("  helper location    : \(res.status ?? "unknown")")
     print("  scan error         : \(res.error ?? "none")")
     print("  networks found     : \(res.nets.count)")
     print("  SSIDs visible      : \(named)/\(res.nets.count)")
     print("  app bundle         : \(appBundlePath())")
+    if s.currentSSID == nil && res.conn != nil {
+        print("")
+        print("  note: the front-end can't read the connected SSID but the helper can;")
+        print("        the TUI header falls back to the helper's value automatically.")
+    }
     if res.nets.count > 0 && named == 0 {
         print("")
         print("  ⚠ SSIDs are masked — Location Services isn't authorized for wifiscan.")
@@ -816,36 +912,158 @@ func runDiag(app: App) {
 func runOnce(app: App, json: Bool) {
     let result = HelperClient.shared.scan()
     HelperClient.shared.shutdown()   // one-shot mode: don't leave a daemon behind
-    let nets = sortNets(result.nets, by: app.sortKey, ascending: app.ascending)
+    if result.error == nil, let path = app.logPath {
+        appendSurveyLog(path, nets: result.nets)   // log the FULL scan, pre-filter
+    }
+    var all = result.nets
+    if let bf = app.bandFilter { all = all.filter { $0.band == bf } }
+    let nets = sortNets(all, by: app.sortKey, ascending: app.ascending)
+    let conn = app.scanner.currentSSID ?? result.conn
     if json {
         struct Out: Encodable {
             let ssid: String; let rssi: Int; let noise: Int?
             let snr: Int?; let channel: Int; let band: String; let widthMHz: Int
-            let security: String; let hidden: Bool
+            let security: String; let hidden: Bool; let utilization: Double?
         }
         let arr = nets.map { Out(ssid: $0.ssid, rssi: $0.rssi,
             noise: $0.noiseValid ? $0.noise : nil, snr: $0.snr, channel: $0.channel,
-            band: $0.band.longLabel, widthMHz: $0.widthMHz, security: $0.security, hidden: $0.hidden) }
+            band: $0.band.longLabel, widthMHz: $0.widthMHz, security: $0.security,
+            hidden: $0.hidden, utilization: $0.utilization) }
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let d = try? enc.encode(arr), let s = String(data: d, encoding: .utf8) { print(s) }
         else { print("[]") }
         if let e = result.error { FileHandle.standardError.write(Data("scan error: \(e)\n".utf8)) }
         return
     }
-    print(Ansi.bold("wifiscan — \(nets.count) networks  (iface \(app.scanner.interfaceName), connected \(app.scanner.currentSSID.map(sanitizeSSID) ?? "—"))"))
+    print(Ansi.bold("wifiscan — \(nets.count) networks  (iface \(app.scanner.interfaceName), connected \(conn.map(sanitizeSSID) ?? "—"))"))
     if let e = result.error { print(Ansi.fg256("scan error: \(e)", Pal.error)) }
     if !nets.isEmpty && result.status != "authorized" && nets.contains(where: { $0.hidden }) {
         print(Ansi.fg256("⚠ SSIDs hidden — enable 'wifiscan' in System Settings → Privacy & Security → Location Services.", Pal.warn))
     }
     print("")
     // One-shot: no cross-scan history, so each sparkline shows its single sample.
-    for line in renderTable(nets, cols: termSize().cols, connSSID: app.scanner.currentSSID, history: [:]) { print(line) }
+    for line in renderTable(nets, cols: termSize().cols, connSSID: conn, history: [:]) { print(line) }
     print("")
     for line in renderGraph(nets, cols: termSize().cols) { print(line) }
     print("")
-    for line in renderRecommendations(nets) { print(line) }
+    for line in renderRecommendations(nets, excluding: app.effectiveExclusions(conn: conn)) { print(line) }
     print("")
     print(Ansi.dim("noise/SNR are only reported by macOS for the channel the radio is tuned to; ‹—› elsewhere is expected."))
+}
+
+// MARK: - Preferences (persisted TUI view settings)
+
+/// Last-used view settings, restored at the next launch (CLI flags override).
+/// Every field is optional so old and new versions of the file coexist.
+struct Prefs: Codable {
+    var sort: String?
+    var ascending: Bool?
+    var band: String?
+    var interval: Double?
+    var autoRefresh: Bool?
+    var graphMode: Bool?
+}
+
+let prefsPath = NSHomeDirectory() + "/.config/wifiscan/config.json"
+
+/// Shared by --sort and the prefs file (SortKey.label.lowercased() maps back here).
+let sortNames: [String: SortKey] = [
+    "power": .power, "snr": .snr, "chan": .channel, "channel": .channel, "name": .name,
+    "band": .band, "width": .width, "sec": .security, "security": .security,
+    "load": .util, "util": .util,
+]
+/// Shared by --band and the prefs file ("all" → no filter).
+let bandNames: [String: Band?] = [
+    "2.4": .ghz24, "2": .ghz24, "24": .ghz24, "5": .ghz5, "6": .ghz6, "all": nil,
+]
+
+func loadPrefs(into app: App) {
+    guard let data = FileManager.default.contents(atPath: prefsPath),
+          let p = try? JSONDecoder().decode(Prefs.self, from: data) else { return }
+    if let s = p.sort, let k = sortNames[s] { app.sortKey = k }
+    if let a = p.ascending { app.ascending = a }
+    if let b = p.band, let v = bandNames[b] { app.bandFilter = v }
+    if let i = p.interval { app.interval = min(60, max(2, i)) }
+    if let a = p.autoRefresh { app.autoRefresh = a }
+    if let g = p.graphMode { app.graphMode = g }
+}
+
+func savePrefs(_ app: App) {
+    let p = Prefs(sort: app.sortKey.label.lowercased(), ascending: app.ascending,
+                  band: app.bandFilter?.label ?? "all", interval: app.interval,
+                  autoRefresh: app.autoRefresh, graphMode: app.graphMode)
+    let dir = (prefsPath as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if let d = try? enc.encode(p) { try? d.write(to: URL(fileURLWithPath: prefsPath)) }
+}
+
+// MARK: - Survey log & report (--log / --report)
+
+/// Append one scan to the JSONL survey log (one SurveyScan object per line).
+func appendSurveyLog(_ path: String, nets: [BSS]) {
+    let scan = SurveyScan(ts: Date().timeIntervalSince1970, nets: nets.map(SurveyNet.init))
+    guard let data = try? JSONEncoder().encode(scan) else { return }
+    if !FileManager.default.fileExists(atPath: path) {
+        FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    guard let fh = FileHandle(forWritingAtPath: path) else { return }
+    defer { try? fh.close() }
+    _ = try? fh.seekToEnd()
+    fh.write(data)
+    fh.write(Data("\n".utf8))
+}
+
+/// Aggregate a --log survey: per band, the cleanest candidate channel for each hour
+/// of day (congestion is time-of-day dependent — an evening-only scan misleads),
+/// plus the minimax "all-day pick" whose worst hour is the least bad.
+func runReport(path: String, app: App) {
+    guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
+        die("cannot read survey log '\(path)'")
+    }
+    let dec = JSONDecoder()
+    let scans = raw.split(whereSeparator: \.isNewline)
+        .compactMap { try? dec.decode(SurveyScan.self, from: Data($0.utf8)) }
+    if scans.isEmpty { die("no scans in '\(path)' — record some with --log first") }
+
+    var excl = app.excludeSSIDs
+    if let c = app.scanner.currentSSID { excl.insert(c) }
+
+    let cal = Calendar.current
+    let hourly = Survey.byHour(scans) { cal.component(.hour, from: Date(timeIntervalSince1970: $0)) }
+
+    let df = DateFormatter()
+    df.locale = Locale(identifier: "en_US_POSIX")
+    df.dateFormat = "yyyy-MM-dd HH:mm"
+    let tsMin = scans.map { $0.ts }.min()!, tsMax = scans.map { $0.ts }.max()!
+    print(Ansi.bold("wifiscan survey — \(scans.count) scans, "
+        + "\(df.string(from: Date(timeIntervalSince1970: tsMin))) → \(df.string(from: Date(timeIntervalSince1970: tsMax)))"))
+    if !excl.isEmpty { print(Ansi.dim("ignoring your networks: \(excl.sorted().map(sanitizeSSID).joined(separator: ", "))")) }
+
+    func loadText(_ w: Double) -> String { w > 0 ? "\(Int((10 * log10(w)).rounded()))dBm" : "clean" }
+
+    let plans: [(Band, [Int], String)] = [
+        (.ghz24, ChannelPlan.cand24, "1/6/11 only"),
+        (.ghz5, ChannelPlan.cand5NonDFS, "non-DFS"),
+        (.ghz6, ChannelPlan.cand6PSC, "PSC"),
+    ]
+    for (band, candidates, note) in plans {
+        guard scans.contains(where: { $0.nets.contains { Band.from($0.band) == band } }) else { continue }
+        print("")
+        print(Ansi.bold(Ansi.fg256("▎ \(band.longLabel)  (\(note))", Pal.heading)))
+        var hourlyLoads: [[ChannelLoad]] = []
+        for h in hourly.keys.sorted() {
+            let loads = Survey.averageLoads(hourly[h]!, band: band, candidates: candidates, excluding: excl)
+            hourlyLoads.append(loads)
+            let best = loads.min(by: Analysis.cleaner)!
+            let hh = padLeft(String(format: "%02d:00", h), 6)
+            print("  \(hh)  ch \(padTo("\(best.channel)", 4)) \(padLeft(loadText(best.weighted), 8))  (\(hourly[h]!.count) scans)")
+        }
+        if let pick = Survey.allDayPick(hourlyLoads) {
+            print("  " + Ansi.bold(Ansi.fg256("all-day pick: ch \(pick.channel)", Pal.best))
+                + Ansi.dim("  (worst hour \(loadText(pick.weighted)))"))
+        }
+    }
 }
 
 // MARK: - Out-of-process scan helper
@@ -860,19 +1078,23 @@ func runOnce(app: App, json: Bool) {
 struct ScanRecord: Codable {
     let ssid: String, rssi: Int, noise: Int, channel: Int
     let band: Int, widthMHz: Int, security: String, hidden: Bool
+    let utilization: Double?
 }
 struct ScanFile: Codable {
     let error: String?
     let status: String?
+    let conn: String?          // the helper's view of the connected SSID (see triggerScan)
     let nets: [ScanRecord]
 }
 private func record(_ b: BSS) -> ScanRecord {
     ScanRecord(ssid: b.ssid, rssi: b.rssi, noise: b.noise, channel: b.channel,
-               band: b.band.rawValue, widthMHz: b.widthMHz, security: b.security, hidden: b.hidden)
+               band: b.band.rawValue, widthMHz: b.widthMHz, security: b.security, hidden: b.hidden,
+               utilization: b.utilization)
 }
 private func bss(_ r: ScanRecord) -> BSS {
     BSS(ssid: r.ssid, rssi: r.rssi, noise: r.noise, channel: r.channel,
-        band: Band.from(r.band), widthMHz: r.widthMHz, security: r.security, hidden: r.hidden)
+        band: Band.from(r.band), widthMHz: r.widthMHz, security: r.security, hidden: r.hidden,
+        utilization: r.utilization)
 }
 
 /// Resolve the real .app bundle path. Bundle.main is unreliable when we're invoked
@@ -934,46 +1156,57 @@ final class HelperClient {
 
     /// One scan via the persistent daemon. On the rare infra failure the daemon is
     /// torn down (see daemonScan), so the next call relaunches a fresh one.
-    func scan() -> (nets: [BSS], error: String?, status: String?) {
+    func scan() -> (nets: [BSS], error: String?, status: String?, conn: String?) {
         lock.lock(); defer { lock.unlock() }
         let bundle = appBundlePath()
         // Without a real .app the `open` relaunch can't reveal SSIDs — fail clearly.
         guard bundle.hasSuffix(".app") else {
-            return ([], "not running from a .app bundle — install with `make`; SSID scan needs the bundle's identity", nil)
+            return ([], "not running from a .app bundle — install with `make`; SSID scan needs the bundle's identity", nil, nil)
         }
-        return daemonScan(bundle: bundle) ?? ([], "scan helper restarting…", nil)
+        return daemonScan(bundle: bundle) ?? ([], "scan helper restarting…", nil, nil)
     }
 
     func shutdown() {
         lock.lock(); defer { lock.unlock() }
+        shutdownLocked()
+    }
+
+    /// Body of shutdown, for callers that ALREADY hold `lock`. NSLock is not
+    /// re-entrant, so daemonScan's timeout path calling the public shutdown() from
+    /// inside scan()'s lock would deadlock the scan thread forever — the spinner
+    /// would never stop and quitting would hang.
+    private func shutdownLocked() {
         if let p = helperPid, processAlive(p) { kill(p, SIGTERM) }
         helperPid = nil; helperPidGlobal = 0
         try? FileManager.default.removeItem(atPath: dir)
     }
 
     /// nil ⇒ infra failure (caller falls back to a one-shot scan).
-    private func daemonScan(bundle: String) -> (nets: [BSS], error: String?, status: String?)? {
+    private func daemonScan(bundle: String) -> (nets: [BSS], error: String?, status: String?, conn: String?)? {
         guard ensureRunning(bundle: bundle) else { return nil }
         seq += 1
         let mySeq = seq
         atomicWriteString(dir + "req", "\(mySeq)")
         let deadline = Date().addingTimeInterval(mySeq == 1 ? 12 : 6)   // first scan settles Location
+        var lastBeat = Date()
         while Date() < deadline {
             if let r = readIntFile(dir + "resp"), r >= mySeq {
                 for _ in 0..<20 {     // the json is written before resp; allow fs settle
                     if let data = FileManager.default.contents(atPath: dir + "scan-\(mySeq).json"),
                        let f = try? JSONDecoder().decode(ScanFile.self, from: data) {
                         try? FileManager.default.removeItem(atPath: dir + "scan-\(mySeq).json")
-                        return (f.nets.map(bss), f.error, f.status)
+                        return (f.nets.map(bss), f.error, f.status, f.conn)
                     }
                     usleep(10_000)
                 }
                 return nil
             }
             usleep(25_000)
-            beat()                 // keep the daemon alive while we wait
+            // Keep the daemon alive while we wait — once a second is plenty (its
+            // staleness window is 15 s); beating every poll tick was ~40 writes/s.
+            if Date().timeIntervalSince(lastBeat) >= 1 { beat(); lastBeat = Date() }
         }
-        shutdown()                 // wedged helper → kill so the next call relaunches fresh
+        shutdownLocked()           // wedged helper → kill so the next call relaunches fresh
         return nil
     }
 
@@ -995,12 +1228,13 @@ final class HelperClient {
         do { try p.run() } catch { return }
         p.waitUntilExit()          // waits for `open`, not the (detached) helper
         let deadline = Date().addingTimeInterval(10)
+        var lastBeat = Date()
         while Date() < deadline {   // wait for the helper to publish its pid
             if let pid = readIntFile(dir + "pid").map({ pid_t($0) }), processAlive(pid) {
                 helperPid = pid; helperPidGlobal = pid; return
             }
             usleep(50_000)
-            beat()
+            if Date().timeIntervalSince(lastBeat) >= 1 { beat(); lastBeat = Date() }
         }
     }
 }
@@ -1053,7 +1287,8 @@ final class ScanDaemon: NSObject, CLLocationManagerDelegate {
         }
         if let reqSeq = readIntFile(dir + "req"), reqSeq > lastDone {
             let r = scanner.scan()
-            let out = ScanFile(error: r.error, status: authStatus(), nets: r.nets.map(record))
+            let out = ScanFile(error: r.error, status: authStatus(),
+                               conn: scanner.currentSSID, nets: r.nets.map(record))
             if let data = try? JSONEncoder().encode(out) {
                 try? data.write(to: URL(fileURLWithPath: dir + "scan-\(reqSeq).json"), options: .atomic)
             }
@@ -1169,52 +1404,106 @@ func printHelp() {
     wifiscan — WiFi survey & channel planner (macOS, CoreWLAN)
 
     USAGE:
-      wifiscan          interactive TUI (default)
-      wifiscan --once   one scan: table + channel map + recommendations, then exit
-      wifiscan --json   one scan as JSON on stdout
-      wifiscan --diag   print scan/permission diagnostics
-      wifiscan --help   show this help  (also -h)
+      wifiscan                   interactive TUI (default)
+      wifiscan --once            one scan: table + channel map + recommendations
+      wifiscan --json            one scan as JSON on stdout
+      wifiscan --diag            print scan/permission diagnostics
+      wifiscan --report <file>   aggregate a --log survey: cleanest channel by hour
+      wifiscan --help            show this help  (also -h)
+
+    OPTIONS:
+      --band 2.4|5|6|all         filter to one band (TUI initial filter / one-shot)
+      --sort power|snr|channel|name|band|width|security|load
+      --exclude-ssid a[,b]       keep your own network(s) out of the recommendations
+                                 (the connected SSID is always excluded)
+      --log <file>               append every scan to a JSONL survey log
 
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 
     TUI KEYS:
-      q / Ctrl-C / Ctrl-D quit · r rescan · g / Tab channel-map · a auto-refresh
-      p/s/c/n/w/e sort (press again to reverse) · b cycle band
-      1/2/6 filter band · 0 all bands · j/k scroll · +/- refresh interval
+      q / Esc / Ctrl-C quit · ? help · r rescan · g / Tab channel-map · a auto-refresh
+      p/s/c/n/w/e/l sort (press again to reverse) · b cycle band
+      1/2/6 filter band · 0 all bands · j/k u/d scroll · +/- refresh interval
+      mouse: wheel scrolls · click a column header to sort
+
+    FILES:
+      ~/.config/wifiscan/config.json   last-used view settings (restored at startup)
     """)
 }
 
+/// Print a usage error to stderr and exit 2.
+func die(_ msg: String) -> Never {
+    FileHandle.standardError.write(Data("error: \(msg) (see --help)\n".utf8))
+    exit(2)
+}
+
 func main() {
-    let args = CommandLine.arguments
+    let args = Array(CommandLine.arguments.dropFirst())
     let app = App()
 
     if args.contains("--help") || args.contains("-h") { printHelp(); return }
 
     // Internal helper mode — reached only when relaunched via `open`, never typed.
     if let i = args.firstIndex(of: "--scan-daemon") {
-        let d = i + 1 < args.count ? args[i+1] : NSTemporaryDirectory() + "wifiscan-daemon/"
+        let d = i + 1 < args.count ? args[i + 1] : NSTemporaryDirectory() + "wifiscan-daemon/"
         ScanDaemon(dir: d).run()
         return
     }
 
-    // Reject anything we don't recognise (--help/-h and the internal --scan-daemon
-    // are handled above; the rest are the user modes). This also turns a stray legacy
-    // `--scan-json` launch into a clean error exit rather than a Terminal pop-up.
-    let known: Set<String> = ["--once", "--json", "--diag"]
-    for a in args.dropFirst() where !known.contains(a) {
-        FileHandle.standardError.write(Data("error: unknown option '\(a)' (see --help)\n".utf8))
-        exit(2)
+    // Parse: bare mode switches plus valued options. Anything unrecognised is a
+    // clean error exit (also turns a stray legacy `--scan-json` launch into an
+    // error rather than a Terminal pop-up).
+    var modes = Set<String>()
+    var bandFlag: Band?? = nil          // parsed --band ("all" → .some(nil))
+    var sortFlag: SortKey?
+    var reportPath: String?
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        func value() -> String? { i += 1; return i < args.count ? args[i] : nil }
+        switch a {
+        case "--once", "--json", "--diag":
+            modes.insert(a)
+        case "--band":
+            guard let v = value(), let b = bandNames[v] else { die("--band needs 2.4|5|6|all") }
+            bandFlag = b
+        case "--sort":
+            guard let v = value(), let k = sortNames[v] else {
+                die("--sort needs power|snr|channel|name|band|width|security|load")
+            }
+            sortFlag = k
+        case "--exclude-ssid":
+            guard let v = value(), !v.isEmpty else { die("--exclude-ssid needs a network name") }
+            app.excludeSSIDs.formUnion(v.split(separator: ",").map(String.init))
+        case "--log":
+            guard let v = value(), !v.isEmpty else { die("--log needs a file path") }
+            app.logPath = (v as NSString).expandingTildeInPath
+        case "--report":
+            guard let v = value(), !v.isEmpty else { die("--report needs a file path") }
+            reportPath = (v as NSString).expandingTildeInPath
+        default:
+            die("unknown option '\(a)'")
+        }
+        i += 1
     }
 
     // Colour is automatic: on for an interactive terminal, off when piped/redirected
     // (or when NO_COLOR is set). No flag needed.
     Ansi.enabled = ProcessInfo.processInfo.environment["NO_COLOR"] == nil && isatty(STDOUT_FILENO) != 0
 
+    // Report mode reads only the log file — no scan, no daemon, no TTY needed.
+    if let path = reportPath { runReport(path: path, app: app); return }
+
     sweepStaleTempFiles()
+
+    // Restore last-used view settings, then let explicit flags override them.
+    loadPrefs(into: app)
+    if let b = bandFlag { app.bandFilter = b }
+    if let k = sortFlag { app.sortKey = k; app.ascending = false }
 
     // If launched without a terminal to draw to (Finder/Spotlight/Dock), reopen in
     // Terminal. One-shot/pipe modes are exempt — they run headless.
-    let interactive = !(args.contains("--once") || args.contains("--json") || args.contains("--diag"))
+    let interactive = modes.isEmpty
     if interactive && isatty(STDOUT_FILENO) == 0 {
         relaunchInTerminal()
         return
@@ -1222,9 +1511,9 @@ func main() {
 
     // Diagnostics and one-shot modes must run even with the radio off (that's
     // exactly when you reach for --diag), so the power check gates only the TUI.
-    if args.contains("--diag") { runDiag(app: app); return }
-    if args.contains("--json") { runOnce(app: app, json: true); return }
-    if args.contains("--once") { runOnce(app: app, json: false); return }
+    if modes.contains("--diag") { runDiag(app: app); return }
+    if modes.contains("--json") { runOnce(app: app, json: true); return }
+    if modes.contains("--once") { runOnce(app: app, json: false); return }
 
     if !app.scanner.powerOn {
         FileHandle.standardError.write(Data("Wi-Fi is powered off (interface \(app.scanner.interfaceName)). Turn it on and retry.\n".utf8))

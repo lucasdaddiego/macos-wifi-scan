@@ -17,6 +17,8 @@ struct BSS {
     var widthMHz: Int      // 20/40/80/160, 0 == unknown
     var security: String
     var hidden: Bool
+    /// QBSS channel utilisation (0…1) from the AP's beacon, when it broadcasts one.
+    var utilization: Double? = nil
 
     var snr: Int? { noise < 0 ? rssi - noise : nil }      // only when noise is real
     var noiseValid: Bool { noise < 0 }
@@ -156,19 +158,30 @@ struct ChannelLoad {
 }
 
 enum Analysis {
-    /// Score every candidate control channel by the energy that overlaps it.
-    static func loads(_ nets: [BSS], band: Band, candidates: [Int]) -> [ChannelLoad] {
-        let inBand = nets.filter { $0.band == band }
+    /// Score every candidate 20 MHz control channel by the energy that lands in it.
+    /// Each AP's power is spread evenly over its occupied span (PSD model), so only
+    /// the overlapping fraction counts — an 80 MHz neighbour costs a 20 MHz slot a
+    /// quarter of its energy, and a half-overlapping 2.4 GHz AP costs half. When the
+    /// AP broadcasts QBSS airtime, mostly-idle APs are discounted (floored at 10%:
+    /// an idle AP still beacons and can wake up any time). `excluding` drops your own
+    /// SSIDs — moving YOUR AP moves its energy with it, so it must not repel the
+    /// recommendation away from its current channel.
+    static func loads(_ nets: [BSS], band: Band, candidates: [Int],
+                      excluding: Set<String> = []) -> [ChannelLoad] {
+        let inBand = nets.filter { $0.band == band && !excluding.contains($0.ssid) }
         return candidates.map { cand in
-            let span = (Band.centerFreq(band, cand) - 10.0, Band.centerFreq(band, cand) + 10.0)
+            let fc = Band.centerFreq(band, cand)
+            let span = (lo: fc - 10.0, hi: fc + 10.0)
             var load = ChannelLoad(channel: cand)
             for ap in inBand {
                 let s = ap.freqSpan
-                if s.lo < span.1 && s.hi > span.0 {     // intervals overlap
-                    load.apCount += 1
-                    load.weighted += ap.linearPower
-                    load.strongest = max(load.strongest, ap.rssi)
-                }
+                let overlap = min(s.hi, span.hi) - max(s.lo, span.lo)
+                guard overlap > 0 else { continue }
+                let widthFrac = overlap / (s.hi - s.lo)   // slice of the AP's PSD in this slot
+                let airtime = ap.utilization.map { max(0.1, $0) } ?? 1.0
+                load.apCount += 1
+                load.weighted += ap.linearPower * widthFrac * airtime
+                load.strongest = max(load.strongest, ap.rssi)
             }
             return load
         }
@@ -184,15 +197,103 @@ enum Analysis {
     }
 
     /// Cleanest candidates first (least overlapping energy, then fewest APs).
-    static func recommend(_ nets: [BSS], band: Band, candidates: [Int]) -> [ChannelLoad] {
-        loads(nets, band: band, candidates: candidates).sorted(by: cleaner)
+    static func recommend(_ nets: [BSS], band: Band, candidates: [Int],
+                          excluding: Set<String> = []) -> [ChannelLoad] {
+        loads(nets, band: band, candidates: candidates, excluding: excluding).sorted(by: cleaner)
+    }
+}
+
+/// Tag for how much busier a candidate is than the cleanest one (`best`), both
+/// ChannelLoad.weighted energy sums:
+///  - nil when the candidate is clean, or within rounding of best (nothing to say)
+///  - "+N dB" above a non-silent best (+3dB ≈ double the interfering energy)
+///  - absolute "N dBm" when best is silent (a relative margin would be infinite)
+func loadMarginLabel(_ w: Double, best: Double) -> String? {
+    guard w > 0 else { return nil }
+    if best > 0 {
+        let db = max(0, Int((10 * log10(w / best)).rounded()))
+        return db == 0 ? nil : "+\(db)dB"
+    }
+    return "\(Int((10 * log10(w)).rounded()))dBm"
+}
+
+// MARK: - Survey log (channel quality over time; --log / --report)
+
+/// One network as logged to a survey JSONL file — just the fields scoring needs.
+struct SurveyNet: Codable {
+    let ssid: String
+    let rssi: Int
+    let channel: Int
+    let band: Int
+    let widthMHz: Int
+    let utilization: Double?
+
+    init(_ b: BSS) {
+        ssid = b.ssid; rssi = b.rssi; channel = b.channel
+        band = b.band.rawValue; widthMHz = b.widthMHz; utilization = b.utilization
+    }
+    /// Back to a BSS for scoring (fields not logged get inert defaults).
+    var bss: BSS {
+        BSS(ssid: ssid, rssi: rssi, noise: 0, channel: channel, band: Band.from(band),
+            widthMHz: widthMHz, security: "", hidden: false, utilization: utilization)
+    }
+}
+
+/// One logged scan: epoch seconds + what was in the air.
+struct SurveyScan: Codable {
+    let ts: Double
+    let nets: [SurveyNet]
+}
+
+enum Survey {
+    /// Average load per candidate over several scans — each scan scored independently
+    /// then averaged, so the result is per-scan energy, comparable between hours with
+    /// different scan counts. apCount/strongest report the peak seen, not the mean.
+    static func averageLoads(_ scans: [[BSS]], band: Band, candidates: [Int],
+                             excluding: Set<String> = []) -> [ChannelLoad] {
+        var acc = candidates.map { ChannelLoad(channel: $0) }
+        guard !scans.isEmpty else { return acc }
+        for scan in scans {
+            let loads = Analysis.loads(scan, band: band, candidates: candidates, excluding: excluding)
+            for i in acc.indices {
+                acc[i].weighted += loads[i].weighted
+                acc[i].apCount = max(acc[i].apCount, loads[i].apCount)
+                acc[i].strongest = max(acc[i].strongest, loads[i].strongest)
+            }
+        }
+        for i in acc.indices { acc[i].weighted /= Double(scans.count) }
+        return acc
+    }
+
+    /// Group logged scans by hour of day. `hourOf` maps epoch seconds → 0…23 and is
+    /// injected so callers pick the calendar/timezone (and tests stay deterministic).
+    static func byHour(_ scans: [SurveyScan], hourOf: (Double) -> Int) -> [Int: [[BSS]]] {
+        var out: [Int: [[BSS]]] = [:]
+        for s in scans { out[hourOf(s.ts), default: []].append(s.nets.map { $0.bss }) }
+        return out
+    }
+
+    /// The all-day pick: the channel whose WORST hour is cleanest (minimax). A channel
+    /// that's pristine at 4am but slammed at 9pm loses to one that's merely OK all day.
+    static func allDayPick(_ hourlyLoads: [[ChannelLoad]]) -> ChannelLoad? {
+        var worst: [Int: ChannelLoad] = [:]
+        for loads in hourlyLoads {
+            for l in loads {
+                if let w = worst[l.channel] {
+                    if l.weighted > w.weighted { worst[l.channel] = l }
+                } else {
+                    worst[l.channel] = l
+                }
+            }
+        }
+        return worst.values.min(by: Analysis.cleaner)
     }
 }
 
 // MARK: - Sorting
 
 enum SortKey {
-    case power, snr, channel, name, band, width, security
+    case power, snr, channel, name, band, width, security, util
     var label: String {
         switch self {
         case .power: return "Power"
@@ -202,43 +303,100 @@ enum SortKey {
         case .band: return "Band"
         case .width: return "Width"
         case .security: return "Security"
+        case .util: return "Load"
         }
     }
 }
 
-/// Strict ordering of two networks for `key`'s default (descending-ish) direction;
-/// every key falls back to RSSI (or, for power, SSID) so the order is total and
-/// stable. Extracted from `sortNets` so each branch — including the SNR nil-coalescing
-/// paths, which a single `sorted` pass can't drive deterministically — is unit-testable.
-/// Unmeasured SNR sorts below any measured value via the -999 sentinel.
-func netBefore(_ a: BSS, _ b: BSS, by key: SortKey) -> Bool {
+/// Three-way compare with a direction flag: -1 ⇒ x first, 0 ⇒ tie, +1 ⇒ y first.
+/// `desc: true` puts the larger value first (most keys' default direction).
+func cmpDir(_ x: Int, _ y: Int, desc: Bool) -> Int {
+    if x == y { return 0 }
+    return (x < y) != desc ? -1 : 1
+}
+/// Double overload (QBSS utilization sorting).
+func cmpDir(_ x: Double, _ y: Double, desc: Bool) -> Int {
+    if x == y { return 0 }
+    return (x < y) != desc ? -1 : 1
+}
+/// Ascending three-way string compare.
+func cmpAsc(_ x: String, _ y: String) -> Int {
+    if x == y { return 0 }
+    return x < y ? -1 : 1
+}
+
+/// Primary comparison for `key` in its default (descending-ish) direction; 0 ⇒ the
+/// pair ties on this key. Kept separate from the tie-break so an ascending sort can
+/// flip ONLY the primary direction — reversing a fully sorted array would flip the
+/// tie-breaks too. Unmeasured SNR/utilization sort below any measured value via
+/// sentinels (-999 / -1).
+func netPrimary(_ a: BSS, _ b: BSS, by key: SortKey) -> Int {
     switch key {
-    case .power:    return a.rssi != b.rssi ? a.rssi > b.rssi : a.ssid < b.ssid
-    case .snr:      return (a.snr ?? -999) != (b.snr ?? -999) ? (a.snr ?? -999) > (b.snr ?? -999) : a.rssi > b.rssi
-    case .channel:  return a.channel != b.channel ? a.channel < b.channel : a.rssi > b.rssi
-    case .name:     return a.ssid.lowercased() != b.ssid.lowercased() ? a.ssid.lowercased() < b.ssid.lowercased() : a.rssi > b.rssi
-    case .band:     return a.band.rawValue != b.band.rawValue ? a.band.rawValue < b.band.rawValue : a.rssi > b.rssi
-    case .width:    return a.widthMHz != b.widthMHz ? a.widthMHz > b.widthMHz : a.rssi > b.rssi
-    case .security: return a.security != b.security ? a.security < b.security : a.rssi > b.rssi
+    case .power:    return cmpDir(a.rssi, b.rssi, desc: true)
+    case .snr:      return cmpDir(a.snr ?? -999, b.snr ?? -999, desc: true)
+    case .channel:  return cmpDir(a.channel, b.channel, desc: false)
+    case .name:     return cmpAsc(a.ssid.lowercased(), b.ssid.lowercased())
+    case .band:     return cmpDir(a.band.rawValue, b.band.rawValue, desc: false)
+    case .width:    return cmpDir(a.widthMHz, b.widthMHz, desc: true)
+    case .security: return cmpAsc(a.security, b.security)
+    case .util:     return cmpDir(a.utilization ?? -1, b.utilization ?? -1, desc: true)
     }
 }
 
+/// Tie-break for primary-equal pairs: strongest RSSI first (name A→Z for power,
+/// whose primary IS the RSSI). Direction-independent, so ties read identically
+/// whichever way the primary is flipped.
+func netTieBreak(_ a: BSS, _ b: BSS, by key: SortKey) -> Bool {
+    key == .power ? a.ssid < b.ssid : a.rssi > b.rssi
+}
+
+/// Strict "a before b" for `key`'s default direction — primary, then tie-break.
+func netBefore(_ a: BSS, _ b: BSS, by key: SortKey) -> Bool {
+    let p = netPrimary(a, b, by: key)
+    return p != 0 ? p < 0 : netTieBreak(a, b, by: key)
+}
+
 func sortNets(_ nets: [BSS], by key: SortKey, ascending: Bool) -> [BSS] {
-    let sorted = nets.sorted { netBefore($0, $1, by: key) }
-    return ascending ? sorted.reversed() : sorted
+    nets.sorted { a, b in
+        let p = netPrimary(a, b, by: key)
+        if p != 0 { return ascending ? p > 0 : p < 0 }
+        return netTieBreak(a, b, by: key)
+    }
 }
 
 // MARK: - CoreWLAN value mappings (kept here so they're unit-testable without the framework)
 
-/// Map a CWChannelWidth raw value to MHz (0 == unknown).
+/// Map a CWChannelWidth raw value to MHz (0 == unknown). 5 is speculative — CoreWLAN
+/// has no public 320 MHz case yet, but Wi-Fi 7 APs exist; if Apple adds it, this stops
+/// a 320 MHz neighbour from being scored as a 20 MHz one.
 func widthCodeToMHz(_ raw: Int) -> Int {
     switch raw {
     case 1: return 20
     case 2: return 40
     case 3: return 80
     case 4: return 160
+    case 5: return 320
     default: return 0
     }
+}
+
+/// Channel utilisation (0…1) from an AP's raw 802.11 information elements, when it
+/// broadcasts a QBSS Load element (id 11: station count u16, channel utilisation u8
+/// in 255ths, admission capacity u16). nil when absent or malformed. This is the
+/// AP's own measure of how busy its channel actually is — a better congestion signal
+/// than RSSI, which only says "loud", not "busy".
+func qbssUtilization(_ ies: Data?) -> Double? {
+    guard let ies = ies else { return nil }
+    let b = [UInt8](ies)
+    var i = 0
+    while i + 2 <= b.count {                              // need id + length
+        let id = Int(b[i]), len = Int(b[i + 1])
+        let body = i + 2
+        guard body + len <= b.count else { return nil }   // truncated stream
+        if id == 11, len >= 3 { return Double(b[body + 2]) / 255.0 }
+        i = body + len
+    }
+    return nil
 }
 
 /// Signal → 256-colour palette index. The fallback for terminals without truecolor
@@ -370,16 +528,21 @@ func bandColorCode(_ b: Band) -> Int {
 func charDisplayWidth(_ c: Character) -> Int {
     // A Character is a grapheme cluster of ≥1 scalar, so .first is never nil; the
     // base (first) scalar decides the cell width.
-    let v = c.unicodeScalars.first!.value
+    let s = c.unicodeScalars.first!
+    let v = s.value
     if v == 0 { return 0 }
-    // Combining marks / zero-width.
-    if (0x0300...0x036F).contains(v) || (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
-    // Wide / fullwidth ranges (CJK, Hangul, fullwidth forms, emoji planes).
+    // Zero-width: combining marks of ANY script (Mn/Me — accents, Hebrew/Arabic
+    // points, variation selectors, …) plus the zero-width format scalars.
+    let cat = s.properties.generalCategory
+    if cat == .nonspacingMark || cat == .enclosingMark { return 0 }
+    if (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
+    // Wide / fullwidth ranges (CJK, Hangul, fullwidth forms, emoji planes, flags).
     let wide: [ClosedRange<UInt32>] = [
         0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
         0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,
         0xF900...0xFAFF, 0xFE10...0xFE19, 0xFE30...0xFE6F, 0xFF00...0xFF60,
-        0xFFE0...0xFFE6, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF, 0x20000...0x3FFFD,
+        0xFFE0...0xFFE6, 0x1F1E6...0x1F1FF, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF,
+        0x20000...0x3FFFD,
     ]
     for r in wide where r.contains(v) { return 2 }
     return 1

@@ -21,9 +21,10 @@ func eq<T: Equatable>(_ a: T, _ b: T, _ msg: String) {
     if a != b { failures += 1; print("FAIL: \(msg) — got \(a), want \(b)") }
 }
 func mk(_ ssid: String, _ rssi: Int, _ ch: Int, _ band: Band, _ w: Int = 20,
-        noise: Int = 0, sec: String = "WPA2", hidden: Bool = false) -> BSS {
+        noise: Int = 0, sec: String = "WPA2", hidden: Bool = false,
+        util: Double? = nil) -> BSS {
     BSS(ssid: ssid, rssi: rssi, noise: noise, channel: ch, band: band,
-        widthMHz: w, security: sec, hidden: hidden)
+        widthMHz: w, security: sec, hidden: hidden, utilization: util)
 }
 /// SSIDs of a sorted result, as one string, for compact ordering assertions.
 func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
@@ -34,8 +35,11 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         testBands()
         testChannelPlan()
         testCongestion()
+        testMargin()
         testSorting()
         testValueMaps()
+        testQBSS()
+        testSurvey()
         testGradients()
         testBars()
         testLayout()
@@ -55,6 +59,11 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         let unmeasured = mk("x", -50, 36, .ghz5, noise: 0)
         ok(unmeasured.snr == nil, "snr nil when noise not measured (== 0)")
         ok(!unmeasured.noiseValid, "noiseValid false when noise == 0")
+
+        // utilization defaults to nil when omitted from the memberwise init.
+        let defaulted = BSS(ssid: "d", rssi: -50, noise: 0, channel: 1, band: .ghz24,
+                            widthMHz: 20, security: "x", hidden: false)
+        ok(defaulted.utilization == nil, "utilization defaults to nil")
 
         // linearPower = 10^(rssi/10): monotonic in rssi, exact at a round value.
         ok(mk("a", -40, 1, .ghz24).linearPower > mk("b", -50, 1, .ghz24).linearPower,
@@ -129,6 +138,8 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(ChannelPlan.coveredChannels(band: .ghz6, control: 9, widthMHz: 40), [9, 13], "6G 40MHz @9")
         eq(ChannelPlan.coveredChannels(band: .ghz6, control: 2, widthMHz: 80), [2], "6G ch2 never bonded")
         eq(ChannelPlan.coveredChannels(band: .ghz6, control: 2, widthMHz: 20), [2], "6G ch2 20MHz")
+        eq(ChannelPlan.coveredChannels(band: .ghz6, control: 37, widthMHz: 320),
+           (0..<16).map { 1 + $0 * 4 }, "6G 320MHz (WiFi 7) @37 covers 16 slots from ch1")
         eq(ChannelPlan.coveredChannels(band: .ghz6, control: 0, widthMHz: 80), [0], "6G control < 1 → control only")
         eq(ChannelPlan.coveredChannels(band: .ghz24, control: 6, widthMHz: 40), [6], "2.4 GHz never bonded → control only")
         eq(ChannelPlan.coveredChannels(band: .unknown, control: 7, widthMHz: 80), [7], "unknown band → control only")
@@ -169,6 +180,48 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         let chHi = ChannelLoad(channel: 44, apCount: 1, weighted: 0.5, strongest: -50)
         let chLo = ChannelLoad(channel: 36, apCount: 1, weighted: 0.5, strongest: -50)
         ok(!Analysis.cleaner(chHi, chLo), "equal energy & APs → lower channel is cleaner")
+
+        // Partial-overlap weighting: an 80 MHz AP spreads its power over its span, so
+        // a 20 MHz candidate inside it collects the width fraction (20/80) of the energy.
+        let wide = mk("w", -50, 36, .ghz5, 80)
+        let wl = Analysis.loads([wide], band: .ghz5, candidates: [36])
+        ok(abs(wl[0].weighted - wide.linearPower * 0.25) < 1e-12, "80MHz AP → 1/4 energy on a 20MHz slot")
+        eq(wl[0].apCount, 1, "wide AP still counts as one AP")
+
+        // 2.4 GHz adjacent-channel: ch3 half-overlaps candidate 1 (10 of its 20 MHz).
+        let adj = mk("adj", -50, 3, .ghz24)
+        let al = Analysis.loads([adj], band: .ghz24, candidates: [1, 6, 11])
+        ok(abs(al[0].weighted - adj.linearPower * 0.5) < 1e-12, "ch3 half-overlaps candidate 1")
+        ok(al[1].weighted > 0 && al[2].weighted == 0, "ch3 bleeds into 6 but not 11")
+
+        // QBSS airtime discounts mostly-idle APs (10% floor); unknown assumed busy.
+        let idle = Analysis.loads([mk("i", -50, 36, .ghz5, util: 0.02)], band: .ghz5, candidates: [36])[0].weighted
+        let half = Analysis.loads([mk("h", -50, 36, .ghz5, util: 0.5)], band: .ghz5, candidates: [36])[0].weighted
+        let full = Analysis.loads([mk("u", -50, 36, .ghz5)], band: .ghz5, candidates: [36])[0].weighted
+        let p = mk("u", -50, 36, .ghz5).linearPower
+        ok(abs(idle - p * 0.1) < 1e-15, "idle AP floored at 10% airtime")
+        ok(abs(half - p * 0.5) < 1e-15, "50% airtime halves the energy")
+        ok(abs(full - p) < 1e-15, "unknown airtime assumed 100%")
+
+        // Excluding your own SSID removes it from the load (but not others).
+        let mine = mk("mine", -30, 36, .ghz5)
+        let theirs = mk("theirs", -70, 36, .ghz5)
+        let ex = Analysis.loads([mine, theirs], band: .ghz5, candidates: [36], excluding: ["mine"])[0]
+        eq(ex.apCount, 1, "excluded SSID doesn't count as an AP")
+        ok(abs(ex.weighted - theirs.linearPower) < 1e-15, "excluded SSID contributes no energy")
+        let recEx = Analysis.recommend([mine], band: .ghz5, candidates: [36, 40], excluding: ["mine"])
+        ok(recEx.first!.channel == 36 && recEx.first!.weighted == 0, "recommend honours exclusions")
+    }
+
+    // MARK: Recommendation margin labels
+
+    static func testMargin() {
+        eq(loadMarginLabel(0, best: 0), nil, "clean candidate → no tag")
+        eq(loadMarginLabel(1e-6, best: 1e-6), nil, "equal to best → no tag")
+        eq(loadMarginLabel(2e-6, best: 1e-6), "+3dB", "double the energy → +3dB")
+        eq(loadMarginLabel(1e-5, best: 1e-6), "+10dB", "10x the energy → +10dB")
+        eq(loadMarginLabel(0.5e-6, best: 1e-6), nil, "below best clamps to no tag")
+        eq(loadMarginLabel(1e-6, best: 0), "-60dBm", "silent best → absolute dBm")
     }
 
     // MARK: Sorting
@@ -179,6 +232,9 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
                   mk("c", -60, 11, .ghz24), mk("d", -40, 2, .ghz24)]
         eq(order(sortNets(pw, by: .power, ascending: false)), "adbc", "power desc, ties by ssid asc")
         eq(sortNets(pw, by: .power, ascending: true).first!.ssid, "c", "power asc → weakest first")
+        // Ascending flips ONLY the primary key — ties still break the default way
+        // (reversing the whole sorted array would flip the tie-breaks too).
+        eq(order(sortNets(pw, by: .power, ascending: true)), "cbad", "power asc keeps ssid-asc ties")
 
         // snr: desc, tie-break by rssi, nil (unmeasured) last.
         let sn = [mk("a", -50, 36, .ghz5, noise: -90),  // snr 40
@@ -216,6 +272,23 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         let se = [mk("a", -50, 1, .ghz24, sec: "WPA3"), mk("b", -40, 1, .ghz24, sec: "Open"),
                   mk("c", -60, 1, .ghz24, sec: "Open")]
         eq(order(sortNets(se, by: .security, ascending: false)), "bca", "security asc, tie by rssi")
+        // Drive the string compare in both argument orders (a sort pass may only probe one).
+        ok(netBefore(mk("o", -50, 1, .ghz24, sec: "Open"), mk("w", -50, 1, .ghz24, sec: "WPA3"), by: .security),
+           "Open before WPA3")
+        ok(!netBefore(mk("w", -50, 1, .ghz24, sec: "WPA3"), mk("o", -50, 1, .ghz24, sec: "Open"), by: .security),
+           "WPA3 after Open")
+
+        // util (QBSS load): desc, unknown last, tie by rssi. Drive netBefore in both
+        // argument orders so the nil-coalescing sentinel paths run deterministically.
+        let ut = [mk("a", -60, 1, .ghz24, util: 0.2), mk("b", -50, 1, .ghz24, util: 0.8),
+                  mk("c", -40, 1, .ghz24), mk("d", -45, 1, .ghz24, util: 0.2)]
+        eq(order(sortNets(ut, by: .util, ascending: false)), "bdac", "util desc, tie by rssi, unknown last")
+        ok(netBefore(mk("m", -50, 1, .ghz24, util: 0.5), mk("n", -50, 1, .ghz24), by: .util),
+           "known load sorts before unknown")
+        ok(!netBefore(mk("n", -50, 1, .ghz24), mk("m", -50, 1, .ghz24, util: 0.5), by: .util),
+           "unknown load sorts after known")
+        ok(netBefore(mk("x", -40, 1, .ghz24, util: 0.3), mk("y", -50, 1, .ghz24, util: 0.3), by: .util),
+           "equal load → stronger rssi first")
 
         // SortKey labels
         eq(SortKey.power.label, "Power", "sortkey power label")
@@ -225,6 +298,7 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(SortKey.band.label, "Band", "sortkey band label")
         eq(SortKey.width.label, "Width", "sortkey width label")
         eq(SortKey.security.label, "Security", "sortkey security label")
+        eq(SortKey.util.label, "Load", "sortkey util label")
     }
 
     // MARK: CoreWLAN value maps
@@ -234,6 +308,7 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(widthCodeToMHz(2), 40, "width 2→40")
         eq(widthCodeToMHz(3), 80, "width 3→80")
         eq(widthCodeToMHz(4), 160, "width 4→160")
+        eq(widthCodeToMHz(5), 320, "width 5→320 (WiFi 7)")
         eq(widthCodeToMHz(9), 0, "width unknown→0")
 
         eq(signalColorCode(-40), 46, "rssi -40 bright green")
@@ -242,6 +317,64 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(signalColorCode(-65), 226, "rssi -65 yellow")
         eq(signalColorCode(-70), 208, "rssi -70 orange")
         eq(signalColorCode(-85), 196, "rssi -85 red")
+    }
+
+    // MARK: QBSS Load parsing
+
+    static func testQBSS() {
+        // Well-formed stream: an SSID IE (id 0) then QBSS Load (id 11, len 5, util 51).
+        let ies = Data([0, 3, 65, 66, 67, 11, 5, 1, 0, 51, 0, 0])
+        ok(abs(qbssUtilization(ies)! - 51.0 / 255.0) < 1e-12, "QBSS utilisation parsed (51/255)")
+        eq(qbssUtilization(Data([0, 3, 65, 66, 67])), nil, "no QBSS IE → nil")
+        eq(qbssUtilization(nil), nil, "nil IE data → nil")
+        eq(qbssUtilization(Data()), nil, "empty IE data → nil")
+        eq(qbssUtilization(Data([11])), nil, "lone id byte → nil")
+        eq(qbssUtilization(Data([11, 9, 1, 2])), nil, "truncated body → nil")
+        eq(qbssUtilization(Data([11, 2, 1, 2])), nil, "QBSS body too short (len<3) → skipped")
+        // A short id-11 element is skipped, but a later well-formed one still counts.
+        ok(qbssUtilization(Data([11, 2, 1, 2, 11, 5, 0, 0, 255, 0, 0])) == 1.0,
+           "well-formed QBSS parsed after a short one")
+    }
+
+    // MARK: Survey aggregation
+
+    static func testSurvey() {
+        // SurveyNet round-trips a BSS through Codable and back.
+        let src = mk("Home", -48, 36, .ghz5, 80, util: 0.3)
+        let scan = SurveyScan(ts: 3600 * 5 + 60, nets: [SurveyNet(src)])
+        let data = try! JSONEncoder().encode(scan)
+        let back = try! JSONDecoder().decode(SurveyScan.self, from: data)
+        eq(back.nets.count, 1, "survey scan round-trips through JSON")
+        let b = back.nets[0].bss
+        ok(b.ssid == "Home" && b.rssi == -48 && b.channel == 36 && b.band == .ghz5
+           && b.widthMHz == 80 && b.utilization == 0.3, "SurveyNet ↔ BSS keeps scoring fields")
+        ok(b.noise == 0 && !b.hidden, "unlogged fields get inert defaults")
+
+        // averageLoads: mean energy per scan (busy scan + empty scan → half), peak counts.
+        let ap = mk("x", -50, 36, .ghz5)
+        let avg = Survey.averageLoads([[ap], []], band: .ghz5, candidates: [36])
+        ok(abs(avg[0].weighted - ap.linearPower / 2) < 1e-15, "averageLoads averages per scan")
+        eq(avg[0].apCount, 1, "averageLoads keeps the peak AP count")
+        eq(avg[0].strongest, -50, "averageLoads keeps the peak RSSI")
+        eq(Survey.averageLoads([], band: .ghz5, candidates: [36])[0].weighted, 0, "no scans → zero loads")
+        ok(Survey.averageLoads([[ap]], band: .ghz5, candidates: [36], excluding: ["x"])[0].weighted == 0,
+           "averageLoads honours exclusions")
+
+        // byHour groups by the injected hour function.
+        let scans = [SurveyScan(ts: 0, nets: [SurveyNet(src)]),
+                     SurveyScan(ts: 3600, nets: []), SurveyScan(ts: 30, nets: [])]
+        let grouped = Survey.byHour(scans) { Int($0 / 3600) % 24 }
+        eq(grouped[0]!.count, 2, "two scans grouped into hour 0")
+        eq(grouped[1]!.count, 1, "one scan grouped into hour 1")
+        eq(grouped[0]![0].count, 1, "logged nets materialise as BSS")
+
+        // allDayPick: minimax — a steady channel beats one with a terrible worst hour.
+        let hourA = [ChannelLoad(channel: 1, apCount: 1, weighted: 0.0, strongest: -80),
+                     ChannelLoad(channel: 6, apCount: 1, weighted: 0.4, strongest: -60)]
+        let hourB = [ChannelLoad(channel: 1, apCount: 1, weighted: 0.9, strongest: -40),
+                     ChannelLoad(channel: 6, apCount: 1, weighted: 0.5, strongest: -60)]
+        eq(Survey.allDayPick([hourA, hourB, hourA])!.channel, 6, "all-day pick minimises the worst hour")
+        ok(Survey.allDayPick([]) == nil, "no data → no pick")
     }
 
     // MARK: Truecolor gradients / band tints
@@ -307,6 +440,11 @@ func order(_ nets: [BSS]) -> String { nets.map { $0.ssid }.joined() }
         eq(charDisplayWidth("A"), 1, "ascii → 1 width")
         eq(charDisplayWidth("你"), 2, "CJK → 2 width")
         eq(charDisplayWidth("😀"), 2, "emoji → 2 width")
+        eq(charDisplayWidth("🇬🇧"), 2, "flag (regional indicators) → 2 width")
+        eq(charDisplayWidth("\u{20D7}"), 0, "combining arrow (Mn beyond Latin block) → 0")
+        eq(charDisplayWidth("\u{05B0}"), 0, "Hebrew point (Mn) → 0")
+        eq(charDisplayWidth("\u{20DD}"), 0, "enclosing circle (Me) → 0")
+        eq(charDisplayWidth("\u{FE0F}"), 0, "variation selector → 0")
 
         eq(displayWidth("abc"), 3, "ascii width")
         eq(displayWidth("你好"), 4, "CJK width = 2 cells each")
